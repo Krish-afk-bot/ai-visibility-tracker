@@ -6,6 +6,7 @@ from threading import Lock
 from typing import Dict, List, Optional, Tuple, Any
 
 from openai import OpenAI, APIStatusError, RateLimitError, APITimeoutError, APIConnectionError
+from config import get_setting, get_int_setting, get_float_setting
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,9 @@ class ProviderRateLimiter:
 
 
 class LLMClientManager:
-    """Singleton-style manager holding cached OpenAI client instances and rate limiters."""
+    """Singleton-style manager holding cached OpenAI client instances and rate limiters.
+    Clients and rate limiters are initialized lazily on first use.
+    """
 
     _instance: Optional["LLMClientManager"] = None
     _init_lock = Lock()
@@ -78,7 +81,6 @@ class LLMClientManager:
         if getattr(self, "_initialized", False):
             return
         self._clients: Dict[str, OpenAI] = {}
-        self._client_keys: Dict[str, str] = {}
         self._rate_limiters: Dict[str, ProviderRateLimiter] = {}
         self._client_lock = Lock()
         self._initialized = True
@@ -87,66 +89,58 @@ class LLMClientManager:
         provider = provider.lower()
         with self._client_lock:
             if provider not in self._rate_limiters:
-                env_rpm = os.getenv(f"{provider.upper()}_RPM")
                 if provider == "openrouter":
                     default_rpm = 20
                 elif provider == "gemini":
                     default_rpm = 15  # Google AI Studio free tier: 15 RPM
                 else:
                     default_rpm = 30
-                try:
-                    rpm = int(env_rpm) if env_rpm else default_rpm
-                except ValueError:
-                    rpm = default_rpm
+
+                rpm = get_int_setting(f"{provider.upper()}_RPM", default_rpm)
                 self._rate_limiters[provider] = ProviderRateLimiter(rpm)
             return self._rate_limiters[provider]
 
     def get_client(self, provider: str) -> OpenAI:
-        """Return or create a cached OpenAI client for the given provider."""
+        """Return or lazily create a cached OpenAI client for the given provider."""
         provider = provider.lower()
         if provider not in BASE_URLS:
             raise ConfigurationError(f"Unsupported provider: '{provider}'. Supported: {list(BASE_URLS.keys())}")
 
-        api_key = os.getenv(f"{provider.upper()}_API_KEY")
-        if not api_key or not api_key.strip():
-            raise ConfigurationError(
-                f"Missing API key for provider '{provider}'. Please set {provider.upper()}_API_KEY in your environment or .env file."
-            )
-        api_key = api_key.strip()
-
         with self._client_lock:
-            cached = self._clients.get(provider)
-            # Reuse the client only while it is backed by the current key, so a
-            # key supplied while the app is running takes effect on the next call.
-            if cached is not None and self._client_keys.get(provider) == api_key:
-                return cached
+            if provider in self._clients:
+                return self._clients[provider]
+
+            api_key = get_setting(f"{provider.upper()}_API_KEY")
+            if not api_key or not str(api_key).strip():
+                raise ConfigurationError(
+                    f"Missing API key for provider '{provider}'. Please configure {provider.upper()}_API_KEY in secrets or environment."
+                )
 
             default_headers: Dict[str, str] = {}
             if provider == "openrouter":
-                referer = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost:8501")
-                title = os.getenv("OPENROUTER_TITLE", "AI Visibility Tracker")
+                referer = get_setting("OPENROUTER_HTTP_REFERER", "http://localhost:8501")
+                title = get_setting("OPENROUTER_TITLE", "AI Visibility Tracker")
                 if referer:
-                    default_headers["HTTP-Referer"] = referer
+                    default_headers["HTTP-Referer"] = str(referer)
                 if title:
-                    default_headers["X-Title"] = title
+                    default_headers["X-Title"] = str(title)
 
-            timeout_val = float(os.getenv(f"{provider.upper()}_TIMEOUT", "45.0"))
+            timeout_val = get_float_setting(f"{provider.upper()}_TIMEOUT", 45.0)
             client = OpenAI(
                 base_url=BASE_URLS[provider],
-                api_key=api_key,
+                api_key=str(api_key).strip(),
                 default_headers=default_headers if default_headers else None,
                 timeout=timeout_val,
                 max_retries=0
             )
             self._clients[provider] = client
-            self._client_keys[provider] = api_key
             return client
 
     def reset_clients(self):
         """Reset cached clients (useful for testing or config changes)."""
         with self._client_lock:
             self._clients.clear()
-            self._client_keys.clear()
+            self._rate_limiters.clear()
 
 
 # Global client manager instance
@@ -162,29 +156,29 @@ def parse_provider_model(provider_model_str: str) -> Tuple[str, str]:
 
 
 def get_available_models() -> List[str]:
-    """Return list of available 'provider:model' strings based on .env config.
+    """Return list of available 'provider:model' strings based on secrets/env config.
     
     A provider is considered available only if its key and at least one model are set.
     """
     available = []
     
     # OpenRouter
-    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    or_models_str = os.getenv("OPENROUTER_MODELS", "").strip()
+    or_key = str(get_setting("OPENROUTER_API_KEY", "") or "").strip()
+    or_models_str = str(get_setting("OPENROUTER_MODELS", "") or "").strip()
     if or_key and or_models_str:
         for m in [m.strip() for m in or_models_str.split(",") if m.strip()]:
             available.append(f"openrouter:{m}")
 
     # Groq
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    groq_models_str = os.getenv("GROQ_MODELS", "").strip()
+    groq_key = str(get_setting("GROQ_API_KEY", "") or "").strip()
+    groq_models_str = str(get_setting("GROQ_MODELS", "") or "").strip()
     if groq_key and groq_models_str:
         for m in [m.strip() for m in groq_models_str.split(",") if m.strip()]:
             available.append(f"groq:{m}")
 
     # Gemini (via official OpenAI-compatible endpoint, only when both key and models are set)
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    gemini_models_str = os.getenv("GEMINI_MODELS", "").strip()
+    gemini_key = str(get_setting("GEMINI_API_KEY", "") or "").strip()
+    gemini_models_str = str(get_setting("GEMINI_MODELS", "") or "").strip()
     if gemini_key and gemini_models_str:
         for m in [m.strip() for m in gemini_models_str.split(",") if m.strip()]:
             available.append(f"gemini:{m}")
@@ -197,7 +191,7 @@ def get_analyzer_model() -> Optional[str]:
     
     ANALYZER_MODEL is strictly required and does NOT fall back to a tested model.
     """
-    configured = os.getenv("ANALYZER_MODEL", "").strip()
+    configured = str(get_setting("ANALYZER_MODEL", "") or "").strip()
     return configured if configured else None
 
 
@@ -207,19 +201,19 @@ def validate_analyzer_config(analyzer_model: Optional[str], selected_models: Opt
     Returns:
         (is_valid: bool, error_message: Optional[str])
     """
-    if not analyzer_model or not analyzer_model.strip():
-        return False, "ANALYZER_MODEL is required. Please configure it in your .env (e.g. 'groq:<model-id>' or 'gemini:<model-id>')."
+    if not analyzer_model or not str(analyzer_model).strip():
+        return False, "ANALYZER_MODEL is required. Please configure it in your secrets or .env (e.g. 'groq:<model-id>' or 'gemini:<model-id>')."
 
-    if ":" not in analyzer_model:
+    if ":" not in str(analyzer_model):
         return False, f"Invalid ANALYZER_MODEL '{analyzer_model}'. Format must be 'provider:model-id' (e.g. 'groq:llama-3.1-8b-instant')."
 
     provider, model = parse_provider_model(analyzer_model)
     if provider not in BASE_URLS:
         return False, f"ANALYZER_MODEL uses unsupported provider '{provider}'. Supported: {list(BASE_URLS.keys())}."
 
-    api_key = os.getenv(f"{provider.upper()}_API_KEY", "").strip()
+    api_key = str(get_setting(f"{provider.upper()}_API_KEY", "") or "").strip()
     if not api_key:
-        return False, f"Missing API key for analyzer provider '{provider}'. Please set {provider.upper()}_API_KEY in .env."
+        return False, f"Missing API key for analyzer provider '{provider}'. Please set {provider.upper()}_API_KEY in secrets or .env."
 
     if selected_models and analyzer_model in selected_models:
         return False, f"ANALYZER_MODEL ('{analyzer_model}') cannot be in the list of selected test models. A model must never grade its own answers."
@@ -271,7 +265,6 @@ def query_ai(
             if content is None or not content.strip():
                 raise LLMClientError(f"Model {provider}:{model} returned an empty completion.")
 
-            logger.info(f"{provider}:{model} responded ({len(content)} chars)")
             return content.strip()
 
         except RateLimitError as e:
