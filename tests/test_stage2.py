@@ -9,7 +9,8 @@ from analysis import (
     extract_competitors,
     fallback_extract_competitors,
     calculate_visibility_score,
-    calculate_model_scores
+    calculate_model_scores,
+    compute_brand_report_metrics
 )
 
 
@@ -169,3 +170,112 @@ def test_calculate_model_scores_ranges():
     assert m1_stats["failed_calls"] == 1
     assert m1_stats["avg_position"] == 1.0
     assert m1_stats["sentiments"]["positive"] == 1
+
+
+# ==========================================
+# Brand Report Metrics (Stage 2) Tests
+# ==========================================
+
+def test_compute_brand_report_metrics_exclusions_and_sov():
+    """Verify failed language model calls are excluded from metrics and SOV calculates accurately."""
+    mock_results = [
+        # Call 1: Target brand HubSpot mentioned (#1), competitors Salesforce, Pipedrive
+        {
+            "status": "ok",
+            "prompt": "Best CRM",
+            "provider": "gemini",
+            "model": "gemini-1.5-flash",
+            "brand_mentioned": True,
+            "mention_count": 1,
+            "position": 1,
+            "sentiment": "positive",
+            "competitors": ["Salesforce", "Pipedrive"],
+            "scan_id": 1,
+            "scan_created_at": "2026-10-01 10:00:00"
+        },
+        # Call 2: Target brand mentioned (#2), competitor Salesforce
+        {
+            "status": "ok",
+            "prompt": "Top sales tools",
+            "provider": "groq",
+            "model": "llama-3.1-8b-instant",
+            "brand_mentioned": True,
+            "mention_count": 2,
+            "position": 2,
+            "sentiment": "positive",
+            "competitors": ["Salesforce"],
+            "scan_id": 1,
+            "scan_created_at": "2026-10-01 10:00:00"
+        },
+        # Call 3: Target brand NOT mentioned, competitor Salesforce, Zoho
+        {
+            "status": "ok",
+            "prompt": "Customer management",
+            "provider": "gemini",
+            "model": "gemini-1.5-flash",
+            "brand_mentioned": False,
+            "mention_count": 0,
+            "position": None,
+            "sentiment": "neutral",
+            "competitors": ["Salesforce", "Zoho"],
+            "scan_id": 2,
+            "scan_created_at": "2026-10-10 10:00:00"
+        },
+        # Call 4: FAILED call - MUST be excluded from all metric calculations
+        {
+            "status": "failed",
+            "prompt": "Best CRM",
+            "provider": "openrouter",
+            "model": "mistral-7b",
+            "error": "429 Rate limited",
+            "brand_mentioned": False,
+            "mention_count": 0,
+            "position": None,
+            "sentiment": "neutral",
+            "competitors": [],
+            "scan_id": 1,
+            "scan_created_at": "2026-10-01 10:00:00"
+        }
+    ]
+
+    metrics = compute_brand_report_metrics(mock_results, target_brand="HubSpot", top_competitors_count=5)
+
+    assert metrics["total_answers"] == 4
+    assert metrics["successful_answers"] == 3
+    assert metrics["failed_calls"] == 1
+    assert metrics["unique_prompts_count"] == 3
+
+    # HubSpot mentions: 1 (call 1) + 2 (call 2) = 3 mentions
+    # Salesforce mentions: 1 + 1 + 1 = 3 mentions
+    # Pipedrive mentions: 1
+    # Zoho mentions: 1
+    # Total mentions = 3 (HubSpot) + 3 (Salesforce) + 1 (Pipedrive) + 1 (Zoho) = 8
+    # Share of voice = 3 / 8 = 37.5%
+    assert metrics["target_brand_mentions"] == 3
+    assert metrics["total_all_mentions"] == 8
+    assert metrics["share_of_voice_pct"] == 37.5
+
+    # Sentiment distribution
+    assert metrics["sentiment_counts"]["positive"] == 2
+    assert metrics["sentiment_counts"]["neutral"] == 0
+
+    # Comparison table check
+    table = metrics["comparison_table"]
+    # Top brand is HubSpot (target)
+    target_row = [r for r in table if r["is_target"]][0]
+    # Coverage: HubSpot mentioned in 2 of 3 successful answers = 66.67%
+    assert round(target_row["coverage_pct"], 1) == 66.7
+    assert target_row["answers_with_mention"] == 2
+    assert target_row["total_answers"] == 3
+    # Average position: (1 + 2) / 2 = 1.5
+    assert target_row["avg_position"] == 1.5
+
+    # Top competitor: Salesforce (mentioned in 3 of 3 answers = 100%)
+    sf_row = [r for r in table if r["brand"] == "Salesforce"][0]
+    assert sf_row["coverage_pct"] == 100.0
+    assert sf_row["answers_with_mention"] == 3
+
+    # Coverage over time: 2 distinct scans (scan 1 and scan 2)
+    assert metrics["scans_count"] == 2
+    assert len(metrics["coverage_over_time"]) > 0
+
