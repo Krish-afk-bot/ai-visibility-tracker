@@ -1,203 +1,131 @@
-<div align="center">
+# 🔍 AI Visibility Tracker
 
-#  AI Visibility Tracker
+A multi-model intelligence tool that queries leading Large Language Models (LLMs) in parallel to measure and benchmark brand visibility, mention rankings, sentiment, and competitor share of voice in AI-generated answers.
 
-**Measure how visible your brand is in AI-generated responses**
-
-![Status](https://img.shields.io/badge/status-active-success.svg)
-![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
-![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
-![Streamlit](https://img.shields.io/badge/streamlit-1.28+-red.svg)
-
-[🚀 Live Demo](https://ai-visibility-tracker-fjt2fxn73cargkaatc6rqr.streamlit.app/) • [📖 Documentation](#how-it-works) • [🛠️ Setup](#local-setup)
-
-</div>
+Designed to operate on a **$0 budget** using only free models from **OpenRouter** and the free tier of **Groq Cloud**.
 
 ---
 
-##  Mission
-
-As AI assistants become the primary way people discover products and services, brand visibility in AI responses is the new SEO. AI Visibility Tracker helps businesses understand and measure their presence in AI-generated recommendations.
-
-##  The Challenge
-
-Traditional marketing metrics don't capture how often AI assistants recommend your brand. When users ask ChatGPT, Gemini, or Claude for product recommendations, is your brand mentioned? How does your visibility compare to competitors?
-
-Without measurement, you can't optimize. Businesses need data on:
-- How frequently AI mentions their brand
-- Sentiment of those mentions (positive, neutral, negative)
-- Which competitors appear alongside them
-- How visibility changes across different prompts
-
-##  Our Solution
-
-AI Visibility Tracker automates brand visibility measurement by:
-1. Querying AI models with custom prompts
-2. Analyzing responses for brand mentions and sentiment
-3. Identifying competitor brands in the same responses
-4. Calculating a visibility score across all prompts
-5. Providing exportable data for tracking over time
-
-##  Key Features
-
-| Feature | Description |
-|---------|-------------|
-|  **Visibility Score** | Percentage of prompts where your brand appears |
-|  **Sentiment Analysis** | Tracks positive, neutral, or negative brand mentions |
-|  **Competitor Tracking** | Identifies which competitors appear in AI responses |
-|  **Batch Scanning** | Test multiple prompts in one scan |
-|  **Data Export** | Download results as CSV for reporting |
-|  **Scan History** | SQLite database stores all scan results |
-
-##  How It Works
+## 📸 Dashboard Preview
 
 ```
-User Input → AI Query → Response Analysis → Visibility Metrics
++----------------------------------------------------------------------------------------------------+
+| 🔍 AI Visibility Tracker                                                                           |
+| [ Current Scan ]     [ Scan History ]     [ Compare Over Time ]                                    |
++----------------------------------------------------------------------------------------------------+
+| Visibility Score per Model                                                                         |
+|  groq:llama-3.1-8b-instant       openrouter:meta-llama/3-8b:free       openrouter:mistral-7b:free   |
+|         85.0%                                 60.0%                              75.0%             |
+|  [|||||||||||||||||||||]             [|||||||||||||]                   [|||||||||||||||||]         |
++----------------------------------------------------------------------------------------------------+
+| Per-Prompt Visibility Grid                                                                         |
+| Prompt                                   | groq:llama-3.1-8b-instant | openrouter:llama-3-8b:free   |
+| What are the best CRM tools for startups?| ✅ Yes (#1)               | ✅ Yes (#3)                  |
+| Recommend top agile PM software          | ❌ No                     | ✅ Yes (#1)                  |
++----------------------------------------------------------------------------------------------------+
+| Competitor Share of Voice                | Sentiment Breakdown & Mention Ranking                   |
+| 👉 Your Brand (6 mentions)                | Positive: 4 | Neutral: 2 | Negative: 0                  |
+| Salesforce (5 mentions)                  | Average Position: #1.5                                  |
++----------------------------------------------------------------------------------------------------+
 ```
+*(Screenshot placeholder: `docs/dashboard_screenshot.png`)*
 
-| Step | Action | Output |
-|------|--------|--------|
-| 1️⃣ | User enters brand name and prompts | Configuration stored |
-| 2️⃣ | System queries Gemini AI for each prompt | Raw AI responses |
-| 3️⃣ | AI analyzes responses for brand mentions | Mention count + sentiment |
-| 4️⃣ | System extracts competitor brand names | Competitor list |
-| 5️⃣ | Calculate visibility score | Score = (mentions / total prompts) × 100 |
-| 6️⃣ | Display results with charts and export | Dashboard + CSV |
+---
 
-##  System Architecture
+## 🚀 Key Features
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Streamlit Web UI                        │
-│                        (app.py)                             │
-└────────────┬────────────────────────────────┬───────────────┘
-             │                                │
-             ▼                                ▼
-┌────────────────────────┐      ┌────────────────────────────┐
-│   Gemini AI Client     │      │   SQLite Database          │
-│  (gemini_client.py)    │      │    (database.py)           │
-│                        │      │                            │
-│ • query_ai()           │      │ • scans table              │
-│ • analyze_brand()      │      │ • scan_results table       │
-│ • extract_competitors()│      │ • get/save operations      │
-└────────────┬───────────┘      └────────────────────────────┘
-             │
-             ▼
-┌────────────────────────┐
-│  Google Gemini API     │
-│  (gemini-2.0-flash)    │
-└────────────────────────┘
-```
+- **Multi-Model Parallel Scanning**: Compare outputs across multiple free models from OpenRouter and Groq in a single execution using concurrent worker threads.
+- **Strict Word-Boundary Matching**: Deterministic Python regex prevents false substring positives (e.g., `apple` will never match `pineapple`). Also supports brand aliases (e.g., `Monday` / `Monday.com`).
+- **Normalized Single-Model Grading**: A dedicated, independent analyzer LLM evaluates sentiment and competitor mentions across all answers. A model never grades its own response.
+- **Combined Analysis for Quota Conservation**: Sentiment and competitor extraction are merged into a single LLM prompt per response, reducing free-tier token usage.
+- **Free-Tier Reliability**:
+  - Exponential backoff with jitter on HTTP 429, 5xx, and network timeouts.
+  - Honors server `Retry-After` headers.
+  - Per-provider rate limiting (token window) prevents rate limit collisions.
+  - Automatic SQLite caching to avoid redundant queries (`Use cached results` toggle).
+  - Fault-tolerant: failing or retired models do not interrupt or crash the scan.
+- **Historical Analysis & Benchmarking**:
+  - **Scan History**: Review past scan runs and reload granular prompt-level records.
+  - **Compare Over Time**: Track longitudinal visibility trajectories across models for any brand.
+- **Export**: Download full run results (including status, errors, sentiment, rank position, and competitors) as a formatted CSV.
 
-##  User Journey
+---
 
-**Scenario**: A startup wants to measure their visibility for "best project management tools"
+## 🛠️ Setup & Installation
 
-1. User opens the app and enters brand name: "Asana"
-2. User adds prompts:
-   - "What are the best project management tools?"
-   - "Recommend a tool for remote team collaboration"
-   - "Which PM software integrates with Slack?"
-3. User clicks "Run Visibility Scan"
-4. System queries Gemini AI with each prompt
-5. AI responses are analyzed:
-   - Prompt 1: Asana mentioned (positive sentiment)
-   - Prompt 2: Asana not mentioned
-   - Prompt 3: Asana mentioned (neutral sentiment)
-6. Dashboard shows:
-   - Visibility Score: 66.7% (2/3 prompts)
-   - Total Mentions: 2
-   - Positive Sentiment: 1/2
-   - Competitors: Trello, Monday.com, Jira
-7. User downloads CSV for reporting
+### 1. Prerequisites
+- Python 3.10+
+- Free API keys from:
+  - [Groq Cloud Console](https://console.groq.com/keys)
+  - [OpenRouter](https://openrouter.ai/keys)
 
-##  Technology Stack
-
-### Frontend
-- **Streamlit** - Web UI framework for rapid prototyping
-- **Pandas** - Data manipulation and CSV export
-- **Python 3.8+** - Core language
-
-### AI & Analysis
-- **Google Gemini API** - AI model for queries and analysis (gemini-2.0-flash)
-- **JSON parsing** - Structured data extraction from AI responses
-- **Regex** - Fallback text analysis
-
-### Data Storage
-- **SQLite** - Lightweight database for scan history
-- **python-dotenv** - Environment variable management
-
-### Deployment
-- **Streamlit Cloud** - Hosted deployment platform
-
-##  Local Setup
-
-### Prerequisites
-- Python 3.8 or higher
-- Google Gemini API key ([Get one here](https://makersuite.google.com/app/apikey))
-
-### Installation
-
-1. Clone the repository
+### 2. Clone and Install Dependencies
 ```bash
-git clone <repository-url>
-cd ai-visibility-tracker
-```
+git clone <repo-url>
+cd ai_visibility_tracker
 
-2. Install dependencies
-```bash
+# Create and activate virtual environment
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# Linux/macOS:
+source venv/bin/activate
+
+# Install pinned dependencies
 pip install -r requirements.txt
 ```
 
-3. Configure environment variables
+### 3. Configure Environment Variables
+Copy `.env.example` to `.env`:
 ```bash
 cp .env.example .env
-# Edit .env and add your GEMINI_API_KEY
 ```
 
-4. Run the application
+Open `.env` and configure your API keys and models:
+```dotenv
+# OpenRouter API Key and Models
+OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxx
+# Copy current live free models ending in :free from https://openrouter.ai/models?max_price=0
+OPENROUTER_MODELS=meta-llama/llama-3.1-8b-instruct:free,mistralai/mistral-7b-instruct:free
+
+# Groq API Key and Models
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx
+# Live Groq model IDs from console.groq.com/docs/models
+GROQ_MODELS=llama-3.1-8b-instant,mixtral-8x7b-32768
+
+# Dedicated Analyzer Model
+ANALYZER_MODEL=groq:llama-3.1-8b-instant
+```
+
+> **Important Note on Free-Tier Models & Limits**:
+> Free models on OpenRouter frequently rotate and change availability. If a model returns 404 or retired errors, filter OpenRouter's model directory by **"Free"** (`max_price=0`) and update your `.env` with active model IDs.
+
+### 4. Run the Streamlit Application
 ```bash
 streamlit run app.py
 ```
-
-5. Open your browser to `http://localhost:8501`
-
-### Environment Variables
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `GEMINI_API_KEY` | Your Google Gemini API key | Yes |
-
-##  Contribution Guidelines
-
-We welcome contributions! Here's how to get started:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes
-4. Test thoroughly
-5. Commit with clear messages (`git commit -m 'Add amazing feature'`)
-6. Push to your branch (`git push origin feature/amazing-feature`)
-7. Open a Pull Request
-
-### Areas for Contribution
-- Add support for additional AI models
-- Improve sentiment analysis accuracy
-- Build historical tracking features
-- Enhance UI/UX design
-- Write tests
-- Improve documentation
-
-##  License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+Open your browser at `http://localhost:8501`.
 
 ---
 
-<div align="center">
+## 🧪 Running Tests
 
-**Built with ❤️ for the future of AI-driven marketing**
+The test suite uses `pytest` with mocked network calls (no real API requests or API keys required):
 
-[Report Bug](https://github.com/yourusername/ai-visibility-tracker/issues) • [Request Feature](https://github.com/yourusername/ai-visibility-tracker/issues)
+```bash
+pytest tests/ -v
+```
 
-</div>
+Test coverage includes:
+- **`tests/test_stage1.py`**: Idempotent SQLite migrations on legacy schemas, CRUD operations, response caching, client pooling, 429 exponential backoff retry with `Retry-After`, and 404 retired model handling.
+- **`tests/test_stage2.py`**: Word-boundary regex matching, brand aliases with symbols, rank position extraction, robust markdown-fenced JSON extraction, single combined sentiment/competitors analysis, and score calculation excluding failures.
+- **`tests/test_stage3.py`**: Parallel execution error isolation (one failing provider not crashing the scan) and SQLite cache hit verification.
+
+---
+
+## 🔬 Methodology & Limitations
+
+1. **LLM Output Non-Determinism**: Generative models produce probabilistic responses. While temperature is kept low (`0.3` for generation, `0.1` for analysis), phrasing can vary between runs. Use the **Runs per prompt** slider (1–5) to measure variance and view visibility ranges.
+2. **Small Sample Sizes**: Visibility percentages across 3–5 prompts provide indicative qualitative signals rather than statistical certainty. For robust benchmarks, include 10+ diverse user prompts representing various stages of the buyer journey.
+3. **Fixed Analyzer Model**: A single configured model (`ANALYZER_MODEL`) evaluates all responses for sentiment and competitor extraction. This ensures consistent grading across models, eliminating evaluator bias.
+4. **Rate Limit Throttling**: Free-tier rate limits (e.g. 20–30 requests per minute) mean large scans (over 30 total queries) will automatically throttle and pace requests via exponential backoff.
