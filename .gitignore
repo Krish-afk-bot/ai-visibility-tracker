@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 *.db
-.streamlit/
 venv/
 .venv/
+.streamlit/secrets.toml
+streamlit.log
+.pytest_cache/
