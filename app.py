@@ -1456,6 +1456,7 @@ with st.sidebar:
             "```toml\n"
             "# Groq Cloud free tier\n"
             'GROQ_API_KEY = "gsk_..."\n'
+            'GROQ_MODELS = "llama-3.1-8b-instant"\n\n'
             "# Dedicated analyzer\n"
             'ANALYZER_MODEL = "groq:llama-3.1-8b-instant"\n'
             "```"
@@ -1472,10 +1473,13 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-        "Prompt library",
-        "Scan history",
-        "Trends"
-    ])
+tab_scan, tab_report, tab_library, tab_history, tab_compare = st.tabs([
+    "Current scan",
+    "Brand report",
+    "Prompt library",
+    "Scan history",
+    "Trends"
+])
 
 
 # ==========================================
@@ -2611,11 +2615,3 @@ with tab_compare:
                 f'{escape_text(chosen_brand)}.</p>',
                 unsafe_allow_html=True
             )
-except Exception as e:
-    exc_type = type(e).__name__
-    logger.exception("Unexpected error in main app body")
-    st.error(
-        f"**Application Error ({exc_type})**\n\n"
-        "An unexpected error occurred while rendering the page. "
-        "Please check your configuration or reload the application."
-    )

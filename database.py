@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import json
+import re
 from contextlib import contextmanager
 from typing import Optional, List, Dict, Any, Generator
 
@@ -359,7 +360,7 @@ def bulk_add_prompts(
         cursor = conn.cursor()
         for line in lines:
             # Strip bullet prefixes if pasted directly from lists
-            cleaned = re.sub(r"^\s*(?:#?\d+[\.\)]|[\*\-•])\s+", "", line).strip()
+            cleaned = re.sub(r"^\s*(?:#?\d+[\.\)]|[\*\-\u2022])\s+", "", line).strip()
             if cleaned:
                 cursor.execute(
                     "INSERT INTO prompts (project_id, text, tag, active) VALUES (?, ?, ?, 1)",
@@ -598,12 +599,16 @@ def restore_database_from_bytes(data: bytes, target_path: Optional[str] = None) 
     
     Raises ValueError with descriptive message if validation fails.
     """
-    if not data or len(data) < 100:
+    if not data:
         raise ValueError("Invalid backup file: file is empty or too small.")
-    
+
     # SQLite files begin with "SQLite format 3\000"
     if not data.startswith(b"SQLite format 3\x00"):
         raise ValueError("Invalid backup file: not a valid SQLite database header.")
+
+    if len(data) < 100:
+        raise ValueError("Invalid backup file: file is empty or too small.")
+
     
     # Write to a temporary file first to test integrity and schema
     import tempfile

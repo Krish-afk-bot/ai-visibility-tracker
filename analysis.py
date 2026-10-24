@@ -1,6 +1,7 @@
 import re
 import json
 import logging
+from collections import Counter
 from typing import List, Dict, Optional, Tuple, Any
 
 from llm_client import query_ai, parse_provider_model, LLMClientError

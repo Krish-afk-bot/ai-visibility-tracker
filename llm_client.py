@@ -211,12 +211,13 @@ def validate_analyzer_config(analyzer_model: Optional[str], selected_models: Opt
     if provider not in BASE_URLS:
         return False, f"ANALYZER_MODEL uses unsupported provider '{provider}'. Supported: {list(BASE_URLS.keys())}."
 
+    # Structural check first: the grader must never be one of the graded models.
+    if selected_models and analyzer_model in selected_models:
+        return False, f"ANALYZER_MODEL ('{analyzer_model}') cannot be in the list of selected test models. A model must never grade its own answers."
+
     api_key = str(get_setting(f"{provider.upper()}_API_KEY", "") or "").strip()
     if not api_key:
         return False, f"Missing API key for analyzer provider '{provider}'. Please set {provider.upper()}_API_KEY in secrets or .env."
-
-    if selected_models and analyzer_model in selected_models:
-        return False, f"ANALYZER_MODEL ('{analyzer_model}') cannot be in the list of selected test models. A model must never grade its own answers."
 
     return True, None
 

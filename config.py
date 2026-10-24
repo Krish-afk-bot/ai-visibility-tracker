@@ -11,9 +11,14 @@ def get_setting(key: str, default: str = "") -> str:
     # 1. Try Streamlit secrets first (Cloud / test-injected)
     try:
         import streamlit as st  # available at runtime; guard for import-time
-        val = st.secrets.get(key, default) if hasattr(st, "secrets") else default
-        if val:
-            return str(val)
+
+        secrets = getattr(st, "secrets", None)
+        if secrets is not None:
+            val = secrets.get(key)
+            # Only trust plain scalar values; a missing secrets file can
+            # surface as an empty mapping or an exception.
+            if isinstance(val, (str, int, float, bool)) and str(val).strip():
+                return str(val)
     except Exception:
         pass
 
