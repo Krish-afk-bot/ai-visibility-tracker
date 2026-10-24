@@ -5,7 +5,8 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime, timedelta, date
 
 import streamlit as st
 import pandas as pd
@@ -16,6 +17,9 @@ from dotenv import load_dotenv
 # keys and model IDs edited in .env without restarting the server.
 load_dotenv(override=True)
 
+import hmac
+from config import get_setting, get_int_setting
+
 from database import (
     init_db,
     create_scan,
@@ -25,11 +29,26 @@ from database import (
     get_cached_response,
     set_cached_response,
     get_all_scans,
+    get_scans_and_results_in_range,
+    get_database_bytes,
+    restore_database_from_bytes,
+    create_project,
+    get_projects,
+    get_project,
+    update_project,
+    delete_project,
+    create_prompt,
+    get_prompts,
+    update_prompt,
+    toggle_prompt_active,
+    delete_prompt,
+    bulk_add_prompts,
+    VALID_PROMPT_TAGS,
 )
 from llm_client import (
     query_ai,
     parse_provider_model,
-    get_available_models,
+    get_available_models as _raw_get_available_models,
     get_analyzer_model,
     validate_analyzer_config,
     LLMClientError,
@@ -44,12 +63,26 @@ from analysis import (
     calculate_model_scores,
     find_model_disagreements,
     generate_comparison_summary,
+    compute_brand_report_metrics,
+    find_visibility_gaps,
+    generate_prompt_ideas,
+    generate_gap_recommendation,
 )
 
 logger = logging.getLogger(__name__)
 
-# Initialize database schema and migrations
-init_db()
+# Run init_db once per process using st.cache_resource
+@st.cache_resource
+def cached_init_db():
+    init_db()
+    return True
+
+cached_init_db()
+
+# Cache get_available_models with TTL=60s so reruns don't inspect settings repeatedly
+@st.cache_data(ttl=60)
+def get_available_models() -> List[str]:
+    return _raw_get_available_models()
 
 # Page configuration
 st.set_page_config(
@@ -220,10 +253,13 @@ SAMPLE_RESULTS = [
 ]
 
 # Session state initialization
+# Default to sample dashboard on first load
 if "scan_results" not in st.session_state:
-    st.session_state.scan_results = None
+    st.session_state.scan_results = SAMPLE_RESULTS
+    st.session_state.scan_brand = "HubSpot"
+    st.session_state.is_sample = True
 if "scan_brand" not in st.session_state:
-    st.session_state.scan_brand = ""
+    st.session_state.scan_brand = "HubSpot"
 if "scan_id" not in st.session_state:
     st.session_state.scan_id = None
 if "prompts_text" not in st.session_state:
@@ -231,7 +267,15 @@ if "prompts_text" not in st.session_state:
 if "validation_error" not in st.session_state:
     st.session_state.validation_error = None
 if "is_sample" not in st.session_state:
-    st.session_state.is_sample = False
+    st.session_state.is_sample = True
+if "calls_used" not in st.session_state:
+    st.session_state.calls_used = 0
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "selected_project_id" not in st.session_state:
+    st.session_state.selected_project_id = None
+if "prompt_ideas" not in st.session_state:
+    st.session_state.prompt_ideas = []
 
 
 # Helper for running a single query unit (supports parallel execution)
@@ -1114,23 +1158,52 @@ st.markdown(
 # Sidebar Configuration
 # ==========================================
 with st.sidebar:
-    st.markdown("#### Scan configuration")
+    projects = get_projects()
+    project_options = {"(None / Custom scan)": None}
+    for p in projects:
+        project_options[f"{p['brand_name']} ({p.get('industry') or 'General'})"] = p["id"]
+    
+    selected_proj_label = st.selectbox(
+        "Project",
+        options=list(project_options.keys()),
+        index=0 if not st.session_state.selected_project_id else (
+            [i for i, (lbl, pid) in enumerate(project_options.items()) if pid == st.session_state.selected_project_id] or [0]
+        )[0],
+        help="Select a saved project to load its brand settings and prompts."
+    )
+    current_proj_id = project_options[selected_proj_label]
+    if current_proj_id != st.session_state.selected_project_id:
+        st.session_state.selected_project_id = current_proj_id
+        if current_proj_id:
+            proj = get_project(current_proj_id)
+            if proj:
+                st.session_state.scan_brand = proj["brand_name"]
+                active_p = get_prompts(current_proj_id, active_only=True)
+                if active_p:
+                    st.session_state.prompts_text = "\n".join([p["text"] for p in active_p])
+        st.rerun()
+
+    active_proj = get_project(current_proj_id) if current_proj_id else None
 
     brand_input = st.text_input(
         "Brand name",
-        value=st.session_state.scan_brand if st.session_state.scan_brand else "",
+        value=active_proj["brand_name"] if active_proj else (st.session_state.scan_brand if st.session_state.scan_brand else ""),
         placeholder="e.g. HubSpot, Nike, Monday.com",
         help="The primary brand or product name you want to track."
     )
 
+    aliases_default = ", ".join(active_proj["aliases"]) if (active_proj and active_proj.get("aliases")) else ""
     aliases_input = st.text_input(
         "Brand aliases",
+        value=aliases_default,
         placeholder="e.g. Monday, monday.com",
         help="Alternative spellings, separated by commas."
     )
 
+    industry_default = active_proj.get("industry") or "" if active_proj else ""
     industry_input = st.text_input(
         "Industry",
+        value=industry_default,
         placeholder="e.g. CRM software",
         help="Optional context for categorizing saved scans."
     )
@@ -1196,6 +1269,27 @@ with st.sidebar:
         if total_calls > 30:
             st.caption("Large scans can hit free-tier rate limits. Retries run automatically.")
 
+    app_password = get_setting("APP_PASSWORD")
+    max_session_calls = get_int_setting("MAX_CALLS_PER_SESSION", 30)
+
+    # Password check if APP_PASSWORD is configured
+    if app_password:
+        if not st.session_state.authenticated:
+            st.markdown("#### Authentication required")
+            pwd_input = st.text_input("App password", type="password", help="Enter password to run real scans.")
+            if st.button("Unlock scans"):
+                if hmac.compare_digest(pwd_input, str(app_password)):
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect password.")
+        else:
+            st.caption("🔒 Authenticated for real scans")
+    else:
+        # Show session call cap status
+        remaining_calls = max(0, max_session_calls - st.session_state.calls_used)
+        st.caption(f"⚡ Session quota: **{remaining_calls}/{max_session_calls}** API calls remaining (cached queries free).")
+
     run_btn = st.button("Run scan", type="primary", use_container_width=True)
 
     # Validation checks
@@ -1204,12 +1298,20 @@ with st.sidebar:
 
         is_analyzer_valid, analyzer_err = validate_analyzer_config(analyzer_model, selected_models)
 
-        if not brand_clean:
+        # Quota and auth check
+        if app_password and not st.session_state.authenticated:
+            st.session_state.validation_error = "Please enter the App Password in the sidebar to run scans."
+        elif not app_password and total_calls > (max_session_calls - st.session_state.calls_used):
+            st.session_state.validation_error = (
+                f"Scan requires {total_calls} calls, but only {max_session_calls - st.session_state.calls_used} "
+                f"remain in your session quota ({max_session_calls} max)."
+            )
+        elif not brand_clean:
             st.session_state.validation_error = "Brand name is required. Add it in the sidebar."
         elif not deduped_prompts:
             st.session_state.validation_error = "Add at least one prompt in the sidebar."
         elif len(selected_models) < 2:
-            st.session_state.validation_error = "Select at least two models."
+            st.session_state.validation_error = "Select at least 2 models to compare."
         elif not is_analyzer_valid:
             st.session_state.validation_error = analyzer_err
         else:
@@ -1220,7 +1322,11 @@ with st.sidebar:
             aliases = [a.strip() for a in aliases_input.split(",") if a.strip()]
             known_comps = [c.strip() for c in competitors_input.split(",") if c.strip()]
 
-            scan_id = create_scan(brand_clean, industry_input.strip() if industry_input.strip() else None)
+            scan_id = create_scan(
+                brand_name=brand_clean,
+                industry=industry_input.strip() if industry_input.strip() else None,
+                project_id=current_proj_id
+            )
             st.session_state.scan_id = scan_id
 
             progress_bar = st.progress(0.0)
@@ -1235,6 +1341,7 @@ with st.sidebar:
             total_units = len(query_units)
             results = []
             completed = 0
+            uncached_calls = 0
 
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = {
@@ -1249,6 +1356,8 @@ with st.sidebar:
                     res = future.result()
                     results.append(res)
                     completed += 1
+                    if not res.get("cached"):
+                        uncached_calls += 1
                     progress_bar.progress(completed / total_units)
                     status_text.text(
                         f"{completed} of {total_units} complete: {res['provider']}:{res['model']}"
@@ -1270,6 +1379,9 @@ with st.sidebar:
                         position=res["position"]
                     )
 
+            # Record non-cached calls against session quota
+            st.session_state.calls_used += uncached_calls
+
             overall_score = calculate_visibility_score(results)
             update_scan_score(scan_id, overall_score if overall_score is not None else 0.0)
 
@@ -1282,24 +1394,72 @@ with st.sidebar:
         st.error(st.session_state.validation_error)
 
     st.divider()
-    st.markdown("#### Provider access")
-    for provider, label in (("openrouter", "OpenRouter"), ("groq", "Groq"), ("gemini", "Gemini")):
-        key_present = bool(os.getenv(f"{provider.upper()}_API_KEY", "").strip())
+    st.markdown("#### Provider status & self-check")
+
+    providers = (("openrouter", "OpenRouter"), ("groq", "Groq"), ("gemini", "Gemini"))
+    configured_any = False
+
+    for provider, label in providers:
+        key_val = get_setting(f"{provider.upper()}_API_KEY")
+        key_present = bool(key_val and str(key_val).strip())
         model_count = sum(1 for m in available_models if m.startswith(f"{provider}:"))
         is_analyzer = bool(analyzer_model and analyzer_model.startswith(f"{provider}:"))
-        if not key_present:
-            detail = "No key"
-        else:
-            bits = ["Key detected"]
-            if model_count:
-                bits.append(f"{model_count} model{'s' if model_count != 1 else ''}")
+
+        if key_present:
+            configured_any = True
+            key_status = "Key configured"
+            bits = [f"{model_count} model{'s' if model_count != 1 else ''}"]
             if is_analyzer:
                 bits.append("analyzer")
-            detail = ", ".join(bits)
+            detail = f"{key_status} ({', '.join(bits)})"
+        else:
+            detail = "Key missing"
+
         st.markdown(
             f'<div class="provider-line"><span>{escape_text(label)}</span>'
             f'<span>{escape_text(detail)}</span></div>',
             unsafe_allow_html=True
+        )
+
+    # Analyzer model self-check
+    st.markdown("#### Analyzer check")
+    if not analyzer_model:
+        st.markdown(
+            '<div class="provider-line"><span>ANALYZER_MODEL</span>'
+            '<span style="color:#B3402F">Missing</span></div>',
+            unsafe_allow_html=True
+        )
+    else:
+        prov, mod = (analyzer_model.split(":", 1) if ":" in analyzer_model else (analyzer_model, ""))
+        supported = prov.lower() in ("openrouter", "groq", "gemini")
+        in_tested = analyzer_model in selected_models
+        if not supported:
+            astatus = "Unsupported provider"
+        elif in_tested:
+            astatus = "Blocked: in tested models"
+        else:
+            astatus = "Configured"
+            configured_any = True
+
+        st.markdown(
+            f'<div class="provider-line"><span>{escape_text(analyzer_model)}</span>'
+            f'<span>{escape_text(astatus)}</span></div>',
+            unsafe_allow_html=True
+        )
+
+    # If nothing is configured at all, show TOML guidance
+    if not configured_any and not available_models:
+        st.info(
+            "**No API keys or models configured.**\n\n"
+            "Add your credentials in Streamlit Cloud (App Settings -> Secrets) or in `.streamlit/secrets.toml` locally.\n\n"
+            "**Format example (TOML strings, # comments):**\n"
+            "```toml\n"
+            "# Groq Cloud free tier\n"
+            'GROQ_API_KEY = "gsk_..."\n'
+            'GROQ_MODELS = "llama-3.1-8b-instant"\n\n'
+            "# Dedicated analyzer\n"
+            'ANALYZER_MODEL = "groq:llama-3.1-8b-instant"\n'
+            "```"
         )
 
 
@@ -1313,7 +1473,14 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-tab_scan, tab_history, tab_compare = st.tabs(["Current scan", "Scan history", "Trends"])
+try:
+    tab_scan, tab_report, tab_library, tab_history, tab_compare = st.tabs([
+        "Current scan",
+        "Brand report",
+        "Prompt library",
+        "Scan history",
+        "Trends"
+    ])
 
 
 # ==========================================
@@ -1588,11 +1755,692 @@ with tab_scan:
         )
 
 
+
 # ==========================================
-# TAB 2: HISTORY
+# TAB 2: BRAND REPORT
+# ==========================================
+with tab_report:
+    st.markdown("### Brand visibility report")
+    st.markdown(
+        '<p class="page-sub">Benchmark your brand visibility, competitor coverage, and share of voice '
+        'across language models over time.</p>',
+        unsafe_allow_html=True
+    )
+
+    # 1. Project / Brand selector
+    available_projects = get_projects()
+    all_known_scans = get_all_scans()
+    all_scan_brands = list(dict.fromkeys([s["brand_name"] for s in all_known_scans if s.get("brand_name")]))
+    
+    col_rep_proj, col_rep_brand = st.columns([1, 1])
+    with col_rep_proj:
+        rep_proj_map = {"(All / Ad-hoc)": None}
+        for p in available_projects:
+            rep_proj_map[f"{p['brand_name']} ({p.get('industry') or 'General'})"] = p["id"]
+        
+        rep_p_labels = list(rep_proj_map.keys())
+        default_p_idx = 0
+        if st.session_state.selected_project_id:
+            matching_p = [i for i, (lbl, pid) in enumerate(rep_proj_map.items()) if pid == st.session_state.selected_project_id]
+            if matching_p:
+                default_p_idx = matching_p[0]
+
+        rep_proj_selected = st.selectbox("Filter by project", options=rep_p_labels, index=default_p_idx, key="rep_proj_select")
+        active_rep_pid = rep_proj_map[rep_proj_selected]
+
+    with col_rep_brand:
+        if active_rep_pid:
+            p_obj = get_project(active_rep_pid)
+            brand_choices = [p_obj["brand_name"]] if p_obj else [st.session_state.scan_brand]
+        else:
+            brand_choices = all_scan_brands if all_scan_brands else [st.session_state.scan_brand]
+        
+        target_report_brand = st.selectbox(
+            "Target brand",
+            options=brand_choices,
+            index=0 if brand_choices else 0,
+            key="rep_brand_select"
+        )
+
+    # 2. Filter Bar
+    st.markdown("#### Filter range")
+    f_col1, f_col2, f_col3, f_col4 = st.columns([1.5, 1.2, 1.8, 0.8])
+    with f_col1:
+        date_preset = st.selectbox(
+            "Date range",
+            options=["All time", "Last 7 days", "Last 14 days", "Last 30 days", "Last 90 days", "Custom range"],
+            index=0,
+            key="rep_date_preset"
+        )
+    with f_col2:
+        tag_choice = st.selectbox(
+            "Prompt tag",
+            options=["All tags", "branded", "non-branded", "top-of-funnel", "bottom-of-funnel"],
+            index=0,
+            key="rep_tag_choice"
+        )
+    
+    # Calculate dates
+    today_dt = date.today()
+    start_dt_str = None
+    end_dt_str = None
+    if date_preset == "Last 7 days":
+        start_dt_str = (today_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+    elif date_preset == "Last 14 days":
+        start_dt_str = (today_dt - timedelta(days=14)).strftime("%Y-%m-%d")
+    elif date_preset == "Last 30 days":
+        start_dt_str = (today_dt - timedelta(days=30)).strftime("%Y-%m-%d")
+    elif date_preset == "Last 90 days":
+        start_dt_str = (today_dt - timedelta(days=90)).strftime("%Y-%m-%d")
+    elif date_preset == "Custom range":
+        custom_cols = st.columns(2)
+        with custom_cols[0]:
+            c_start = st.date_input("Start date", value=today_dt - timedelta(days=30), key="rep_c_start")
+            start_dt_str = c_start.strftime("%Y-%m-%d") if c_start else None
+        with custom_cols[1]:
+            c_end = st.date_input("End date", value=today_dt, key="rep_c_end")
+            end_dt_str = (c_end + timedelta(days=1)).strftime("%Y-%m-%d") if c_end else None
+
+    # Fetch raw data from DB
+    raw_report_results = get_scans_and_results_in_range(
+        brand_name=target_report_brand if not active_rep_pid else None,
+        project_id=active_rep_pid,
+        start_date=start_dt_str,
+        end_date=end_dt_str
+    )
+
+    # If no stored results in DB (e.g. running on sample dashboard state), use current session scan results
+    using_session_fallback = False
+    if not raw_report_results and st.session_state.scan_results:
+        raw_report_results = [
+            dict(r, scan_brand=target_report_brand, scan_created_at=datetime.now().strftime("%Y-%m-%d"))
+            for r in st.session_state.scan_results
+        ]
+        using_session_fallback = True
+
+    # Language model options in filtered rows
+    present_models = list(dict.fromkeys([
+        f"{r.get('provider')}:{r.get('model')}" for r in raw_report_results if r.get("provider") and r.get("model")
+    ]))
+
+    with f_col3:
+        chosen_models = st.multiselect(
+            "Language models",
+            options=present_models,
+            default=present_models,
+            key="rep_models_multiselect",
+            help="Filter answers by specific language models."
+        )
+
+    with f_col4:
+        st.write("")
+        st.write("")
+        if st.button("Reset filters", key="rep_btn_reset"):
+            st.session_state.rep_date_preset = "All time"
+            st.session_state.rep_tag_choice = "All tags"
+            st.rerun()
+
+    # Filter rows based on tag and chosen models
+    filtered_report_results = []
+    for r in raw_report_results:
+        pm_key = f"{r.get('provider')}:{r.get('model')}"
+        if chosen_models and pm_key not in chosen_models:
+            continue
+        if tag_choice != "All tags":
+            # Compare prompt_tag if joined from prompts table
+            ptag = r.get("prompt_tag")
+            if ptag:
+                if ptag != tag_choice:
+                    continue
+            else:
+                # Basic heuristic fallback for non-linked prompts
+                p_text_lower = r.get("prompt", "").lower()
+                b_name_lower = target_report_brand.lower()
+                is_br = b_name_lower in p_text_lower
+                if tag_choice == "branded" and not is_br:
+                    continue
+                elif tag_choice == "non-branded" and is_br:
+                    continue
+                elif tag_choice in ["top-of-funnel", "bottom-of-funnel"]:
+                    # Cannot strictly determine without project tag
+                    continue
+
+        filtered_report_results.append(r)
+
+    # 3. Header Summary Metric
+    num_unique_prompts = len(set([r.get("prompt") for r in filtered_report_results if r.get("prompt")]))
+    num_answers = len(filtered_report_results)
+    
+    st.markdown(
+        f'<div class="section-note" style="margin-top: 8px; font-weight: 500;">'
+        f'Based on <strong>{num_unique_prompts}</strong> prompts, <strong>{num_answers}</strong> language model answers.'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
+    if num_answers == 0:
+        st.info("No answers match the selected filters. Adjust your date range, tag, or model selection.")
+    else:
+        # Compute metrics
+        rep_metrics = compute_brand_report_metrics(filtered_report_results, target_brand=target_report_brand)
+
+        # Exclusion alert
+        if rep_metrics["failed_calls"] > 0:
+            st.caption(
+                f"ℹ️ {rep_metrics['failed_calls']} failed language model call"
+                f"{'s' if rep_metrics['failed_calls'] != 1 else ''} excluded from report scoring."
+            )
+
+        # 4. Top KPI Cards: Share of Voice & Coverage & Sentiment
+        st.markdown("#### Visibility overview")
+        kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
+        with kpi_col1:
+            st.markdown(
+                f'<div class="brand-panel">'
+                f'<div class="sov-name" style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--pencil);">Share of voice</div>'
+                f'<div style="font-size: 32px; font-weight: 700; color: var(--graphite); margin: 6px 0;">{rep_metrics["share_of_voice_pct"]:.1f}%</div>'
+                f'<div style="font-size: 13px; color: var(--pencil);">'
+                f'{rep_metrics["target_brand_mentions"]} mentions out of {rep_metrics["total_all_mentions"]} total brand mentions in range.'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+        with kpi_col2:
+            target_row = rep_metrics["comparison_table"][0]
+            st.markdown(
+                f'<div class="brand-panel">'
+                f'<div class="sov-name" style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--pencil);">Coverage rate</div>'
+                f'<div style="font-size: 32px; font-weight: 700; color: var(--graphite); margin: 6px 0;">{target_row["coverage_pct"]:.1f}%</div>'
+                f'<div style="font-size: 13px; color: var(--pencil);">'
+                f'Named in {target_row["answers_with_mention"]} of {target_row["total_answers"]} language model answers.'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+        with kpi_col3:
+            s_counts = rep_metrics["sentiment_counts"]
+            total_sent = sum(s_counts.values())
+            pos_pct = (s_counts["positive"] / total_sent * 100.0) if total_sent > 0 else 0.0
+            st.markdown(
+                f'<div class="brand-panel">'
+                f'<div class="sov-name" style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--pencil);">Sentiment tone</div>'
+                f'<div style="font-size: 32px; font-weight: 700; color: var(--graphite); margin: 6px 0;">{pos_pct:.0f}% Positive</div>'
+                f'<div style="font-size: 13px; color: var(--pencil);">'
+                f'{s_counts["positive"]} positive, {s_counts["neutral"]} neutral, {s_counts["negative"]} negative ({total_sent} evaluated).'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+        st.divider()
+
+        # 5. Comparison Panels: Chosen Brand vs. Top 5 Competitors
+        st.markdown(f"#### {escape_text(target_report_brand)} vs. Top competitors")
+        st.markdown(
+            '<p class="section-note">Comparison across language model completions. Competitors are identified by the analyzer model.</p>',
+            unsafe_allow_html=True
+        )
+
+        comp_table_data = rep_metrics["comparison_table"]
+        
+        # Render Comparison Cards
+        for row in comp_table_data:
+            b_name = row["brand"]
+            is_tgt = row["is_target"]
+            c_pct = row["coverage_pct"]
+            m_pct = row["share_of_mentions_pct"]
+            n_ans = row["answers_with_mention"]
+            tot_ans = row["total_answers"]
+            m_count = row["mentions"]
+            tot_m = rep_metrics["total_all_mentions"]
+            avg_p = f"#{row['avg_position']:.1f}" if row.get("avg_position") is not None else "—"
+            tied_badge = ' <span style="font-size: 11px; background: var(--rule); padding: 2px 5px; border-radius: 3px;">(Tied)</span>' if row.get("is_tied_coverage") else ""
+            target_badge = ' <span style="font-size: 11px; background: var(--highlighter); color: var(--graphite); font-weight: 600; padding: 2px 6px; border-radius: 3px;">YOU</span>' if is_tgt else ""
+
+            st.markdown(
+                f'<div class="brand-panel" style="margin-bottom: 12px; {"border-left: 4px solid var(--graphite);" if is_tgt else ""}">'
+                f'<div style="display: flex; justify-content: space-between; align-items: baseline;">'
+                f'<div style="font-size: 18px; font-weight: 600;">{escape_text(b_name)}{target_badge}</div>'
+                f'<div style="font-size: 14px; color: var(--pencil);">Avg mention position: <strong>{avg_p}</strong></div>'
+                f'</div>'
+                f'<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 10px;">'
+                f'<div>'
+                f'<div style="font-size: 13px; color: var(--pencil);">Coverage: <strong>{c_pct:.1f}%</strong>{tied_badge} <small>({n_ans}/{tot_ans} answers)</small></div>'
+                f'<div class="sov-track"><div class="sov-fill" style="width: {c_pct:.1f}%;"></div></div>'
+                f'</div>'
+                f'<div>'
+                f'<div style="font-size: 13px; color: var(--pencil);">Share of mentions: <strong>{m_pct:.1f}%</strong> <small>({m_count}/{tot_m} mentions)</small></div>'
+                f'<div class="sov-track"><div class="sov-fill" style="width: {m_pct:.1f}%; background: var(--model-sage);"></div></div>'
+                f'</div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+        st.divider()
+
+        # 6. Coverage Over Time Line Chart
+        st.markdown("#### Coverage over time")
+        time_data = rep_metrics["coverage_over_time"]
+        
+        if rep_metrics["scans_count"] < 2:
+            st.info(
+                f"At least 2 scans in the selected range are required to show coverage over time. "
+                f"Currently, there {'is 1 scan' if rep_metrics['scans_count'] == 1 else 'are 0 scans'} in this range."
+            )
+        else:
+            time_toggle = st.radio(
+                "Display competitors:",
+                options=["You + top 5", "You + all"],
+                horizontal=True,
+                key="rep_time_toggle"
+            )
+
+            df_time = pd.DataFrame(time_data)
+            if time_toggle == "You + top 5":
+                allowed_brands = set([target_report_brand] + rep_metrics["top_competitors"][:5])
+                df_time = df_time[df_time["brand"].isin(allowed_brands)]
+
+            # Altair line chart
+            chart_brands = list(df_time["brand"].unique())
+            time_colors = model_color_map(chart_brands)
+
+            time_chart = (
+                alt.Chart(df_time)
+                .mark_line(point=True, strokeWidth=2.5)
+                .encode(
+                    x=alt.X(
+                        "scan_date:N",
+                        title="Scan Date",
+                        axis=alt.Axis(
+                            labelColor="#5F666D",
+                            titleColor="#5F666D",
+                            gridColor="#D5D9DC",
+                            domainColor="#D5D9DC",
+                            labelFont=FONT_FAMILY,
+                            titleFont=FONT_FAMILY
+                        )
+                    ),
+                    y=alt.Y(
+                        "coverage_pct:Q",
+                        title="Coverage (%)",
+                        scale=alt.Scale(domain=[0, 100]),
+                        axis=alt.Axis(
+                            labelColor="#5F666D",
+                            titleColor="#5F666D",
+                            gridColor="#D5D9DC",
+                            domainColor="#D5D9DC",
+                            labelFont=FONT_FAMILY,
+                            titleFont=FONT_FAMILY
+                        )
+                    ),
+                    color=alt.Color(
+                        "brand:N",
+                        scale=alt.Scale(
+                            domain=chart_brands,
+                            range=[time_colors[b] for b in chart_brands]
+                        ),
+                        legend=alt.Legend(
+                            orient="bottom",
+                            title=None,
+                            labelFont=FONT_FAMILY
+                        )
+                    ),
+                    tooltip=[
+                        alt.Tooltip("brand:N", title="Brand"),
+                        alt.Tooltip("scan_date:N", title="Date"),
+                        alt.Tooltip("coverage_pct:Q", title="Coverage %", format=".1f"),
+                        alt.Tooltip("answers_naming_brand:Q", title="Answers naming brand"),
+                        alt.Tooltip("total_answers:Q", title="Total answers in scan")
+                    ]
+                )
+                .properties(height=340)
+                .configure_view(stroke=None)
+            )
+
+            st.altair_chart(time_chart, use_container_width=True)
+            st.caption("Coverage % measures the percentage of successful language model answers that named each brand.")
+
+        st.divider()
+
+        # 7. "Where you're missing" (Deterministic Rule-Based Gap Analysis)
+        st.markdown("#### Where you're missing")
+        st.markdown(
+            '<p class="section-note">Rule-based analysis identifying questions where competitors appear in '
+            'most language model answers (&ge; 50%) but your brand appears in few or none (< 50%). '
+            'Sorted by gap size.</p>',
+            unsafe_allow_html=True
+        )
+
+        detected_gaps = find_visibility_gaps(filtered_report_results, target_brand=target_report_brand)
+
+        if not detected_gaps:
+            st.success(
+                f"🎉 No major visibility gaps found in this range! Whenever competitors appeared, "
+                f"**{target_report_brand}** also appeared consistently across language models."
+            )
+        else:
+            for g_idx, gap in enumerate(detected_gaps):
+                gap_prompt = gap["prompt"]
+                gap_size = gap["gap_size"]
+                c_cov = gap["competitor_coverage_pct"]
+                b_cov = gap["brand_coverage_pct"]
+                comps_list = gap["competitors"]
+                models_omit = gap["models_omitting_brand"]
+                models_comp = gap["models_naming_competitors"]
+
+                rec_text = generate_gap_recommendation(gap, target_brand=target_report_brand)
+
+                st.markdown(
+                    f'<div class="brand-panel" style="margin-bottom: 14px; border-left: 4px solid var(--brick);">'
+                    f'<div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap;">'
+                    f'<div style="font-size: 16px; font-weight: 600; color: var(--graphite);">'
+                    f'#{g_idx + 1} "{escape_text(gap_prompt)}"'
+                    f'</div>'
+                    f'<div style="font-size: 13px; font-weight: 600; color: var(--brick);">'
+                    f'Gap size: +{gap_size:.1f}%'
+                    f'</div>'
+                    f'</div>'
+                    f'<div style="display: flex; gap: 24px; font-size: 13px; color: var(--pencil); margin-top: 6px;">'
+                    f'<span>Competitor coverage: <strong style="color: var(--graphite);">{c_cov:.1f}%</strong></span>'
+                    f'<span>Your coverage: <strong style="color: var(--graphite);">{b_cov:.1f}%</strong></span>'
+                    f'<span>Answers: {gap["answers_count"]}</span>'
+                    f'</div>'
+                    f'<div style="margin-top: 10px; font-size: 13px;">'
+                    f'<strong style="color: var(--pencil);">Competitors appearing:</strong> '
+                    f'{" ".join([f"`{escape_text(c["name"])} ({c["count"]})`" for c in comps_list])}'
+                    f'</div>'
+                    f'<div style="margin-top: 6px; font-size: 12px; color: var(--pencil);">'
+                    f'Language models omitting your brand: '
+                    f'{" ".join([f"<span class=\'model-tag\'>{escape_text(m)}</span>" for m in models_omit])}'
+                    f'</div>'
+                    f'<div style="margin-top: 12px; padding: 10px 14px; background: rgba(0,0,0,0.03); border: 1px dashed var(--rule); border-radius: 4px; font-size: 13px; color: var(--graphite);">'
+                    f'<strong>📋 Suggested next step:</strong> {escape_text(rec_text)}'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+
+
+# ==========================================
+# TAB: PROMPT LIBRARY & PROJECTS
+# ==========================================
+with tab_library:
+    st.markdown("### Prompt library")
+    st.markdown(
+        '<p class="page-sub">Organize your buyer prompts by project and funnel stage, '
+        'and run batch scans across language models.</p>',
+        unsafe_allow_html=True
+    )
+
+    all_projs = get_projects()
+
+    # Project selection / creation bar
+    col_sel_p, col_new_p = st.columns([2, 1])
+    with col_sel_p:
+        proj_names = {f"{p['brand_name']} ({p.get('industry') or 'General'})": p["id"] for p in all_projs}
+        if proj_names:
+            current_idx = 0
+            if st.session_state.selected_project_id:
+                ids = list(proj_names.values())
+                if st.session_state.selected_project_id in ids:
+                    current_idx = ids.index(st.session_state.selected_project_id)
+            lib_proj_label = st.selectbox("Select project", options=list(proj_names.keys()), index=current_idx)
+            lib_proj_id = proj_names[lib_proj_label]
+        else:
+            lib_proj_id = None
+            st.info("No projects yet. Create your first project on the right to organize prompts.")
+
+    with col_new_p:
+        with st.expander("➕ Create new project"):
+            new_p_brand = st.text_input("Brand name", key="new_proj_brand", placeholder="e.g. Asana")
+            new_p_aliases = st.text_input("Aliases (comma-separated)", key="new_proj_aliases", placeholder="e.g. Asana Inc")
+            new_p_ind = st.text_input("Industry", key="new_proj_ind", placeholder="e.g. Project Management")
+            if st.button("Create project", key="btn_create_proj"):
+                if new_p_brand.strip():
+                    created_pid = create_project(
+                        brand_name=new_p_brand.strip(),
+                        aliases=[a.strip() for a in new_p_aliases.split(",") if a.strip()],
+                        industry=new_p_ind.strip() if new_p_ind.strip() else None
+                    )
+                    st.session_state.selected_project_id = created_pid
+                    st.session_state.scan_brand = new_p_brand.strip()
+                    st.success(f"Created project '{new_p_brand.strip()}'.")
+                    st.rerun()
+                else:
+                    st.warning("Please provide a brand name.")
+
+    if lib_proj_id:
+        active_project = get_project(lib_proj_id)
+        st.session_state.selected_project_id = lib_proj_id
+
+        # Quick project actions & summary
+        col_info, col_run = st.columns([3, 1])
+        with col_info:
+            p_prompts = get_prompts(lib_proj_id)
+            active_count = sum(1 for p in p_prompts if p["active"])
+            st.caption(
+                f"**Project:** {active_project['brand_name']} | "
+                f"**Industry:** {active_project.get('industry') or 'General'} | "
+                f"**Total prompts:** {len(p_prompts)} ({active_count} active)"
+            )
+        with col_run:
+            if st.button("🚀 Run all active prompts", key="btn_run_active_lib", use_container_width=True):
+                active_list = [p["text"] for p in p_prompts if p["active"]]
+                if not active_list:
+                    st.warning("No active prompts in this project to run.")
+                else:
+                    st.session_state.prompts_text = "\n".join(active_list)
+                    st.session_state.scan_brand = active_project["brand_name"]
+                    st.info(f"Loaded {len(active_list)} active prompts into scan configuration. Click 'Run scan' in the sidebar.")
+
+        st.divider()
+
+        # Add single prompt or bulk paste
+        col_single, col_bulk = st.columns([1, 1])
+        with col_single:
+            with st.expander("Add single prompt", expanded=False):
+                single_text = st.text_input("Prompt text", key="lib_single_text", placeholder="What are the top CRM tools?")
+                single_tag = st.selectbox(
+                    "Tag",
+                    options=["non-branded", "branded", "top-of-funnel", "bottom-of-funnel"],
+                    key="lib_single_tag"
+                )
+                if st.button("Add prompt", key="btn_lib_add_single"):
+                    if single_text.strip():
+                        create_prompt(lib_proj_id, single_text.strip(), tag=single_tag, active=True)
+                        st.success("Prompt added to library.")
+                        st.rerun()
+                    else:
+                        st.warning("Prompt text cannot be empty.")
+
+        with col_bulk:
+            with st.expander("Bulk paste prompts", expanded=False):
+                bulk_text = st.text_area(
+                    "Paste prompts (one per line)",
+                    key="lib_bulk_text",
+                    height=100,
+                    placeholder="1. Best project management software\n2. Jira vs Asana comparison\n* Top tools for sprint planning"
+                )
+                bulk_tag = st.selectbox(
+                    "Assign tag to all",
+                    options=["top-of-funnel", "bottom-of-funnel", "non-branded", "branded"],
+                    key="lib_bulk_tag"
+                )
+                if st.button("Bulk add", key="btn_lib_add_bulk"):
+                    if bulk_text.strip():
+                        added = bulk_add_prompts(lib_proj_id, bulk_text, tag=bulk_tag)
+                        st.success(f"Added {added} prompts with tag '{bulk_tag}'.")
+                        st.rerun()
+                    else:
+                        st.warning("Paste at least one line.")
+
+        # Prompt Ideas via Analyzer Language Model
+        st.markdown("#### ✨ Prompt ideas generator")
+        st.markdown(
+            '<p class="section-note">Ask the analyzer language model to suggest 10 buyer-style prompts '
+            'for your industry, categorized across funnel tags. Accept individual ideas directly into your library.</p>',
+            unsafe_allow_html=True
+        )
+
+        col_gen_btn, col_gen_ind = st.columns([1, 2])
+        with col_gen_ind:
+            idea_industry = st.text_input(
+                "Target industry / category",
+                value=active_project.get("industry") or "",
+                placeholder="e.g. CRM Software, Project Management",
+                key="lib_idea_industry"
+            )
+        with col_gen_btn:
+            st.write("")
+            st.write("")
+            generate_ideas_btn = st.button("💡 Generate 10 prompt ideas", key="btn_generate_ideas", use_container_width=True)
+
+        if generate_ideas_btn:
+            analyzer_m = get_analyzer_model()
+            if not analyzer_m:
+                st.error("ANALYZER_MODEL is not configured. Please set ANALYZER_MODEL in your secrets or .env.")
+            elif not idea_industry.strip():
+                st.warning("Please specify an industry/category to tailor the prompt ideas.")
+            else:
+                with st.spinner(f"Asking analyzer language model ({analyzer_m}) for 10 buyer prompts..."):
+                    try:
+                        ideas = generate_prompt_ideas(
+                            industry=idea_industry.strip(),
+                            brand_name=active_project["brand_name"],
+                            analyzer_model=analyzer_m,
+                            count=10
+                        )
+                        st.session_state.prompt_ideas = ideas
+                        st.success(f"Generated {len(ideas)} buyer prompts!")
+                    except Exception as e:
+                        logger.exception("Error generating prompt ideas")
+                        st.error(f"Failed to generate prompt ideas: {str(e)}")
+
+        if st.session_state.prompt_ideas:
+            with st.expander(f"Review and accept suggested ideas ({len(st.session_state.prompt_ideas)} available)", expanded=True):
+                for idx, idea in enumerate(list(st.session_state.prompt_ideas)):
+                    c_itxt, c_itag, c_iadd = st.columns([5, 2, 1.2])
+                    with c_itxt:
+                        st.write(f"**{idea['text']}**")
+                    with c_itag:
+                        st.caption(f"🏷️ `{idea['tag']}`")
+                    with c_iadd:
+                        if st.button("Accept", key=f"btn_accept_idea_{idx}"):
+                            create_prompt(lib_proj_id, idea["text"], tag=idea["tag"], active=True)
+                            st.session_state.prompt_ideas = [
+                                item for item in st.session_state.prompt_ideas if item["text"] != idea["text"]
+                            ]
+                            st.success(f"Added to library!")
+                            st.rerun()
+
+                if st.button("Accept all remaining ideas", key="btn_accept_all_ideas"):
+                    accepted_count = 0
+                    for item in st.session_state.prompt_ideas:
+                        create_prompt(lib_proj_id, item["text"], tag=item["tag"], active=True)
+                        accepted_count += 1
+                    st.session_state.prompt_ideas = []
+                    st.success(f"Accepted {accepted_count} prompts into your project library!")
+                    st.rerun()
+
+        # Prompts Table and Controls
+        st.markdown("#### Library items")
+        filter_tag = st.selectbox(
+            "Filter by tag",
+            options=["All", "branded", "non-branded", "top-of-funnel", "bottom-of-funnel"],
+            index=0,
+            key="lib_filter_tag"
+        )
+
+        display_prompts = get_prompts(
+            lib_proj_id,
+            tag=None if filter_tag == "All" else filter_tag
+        )
+
+        if not display_prompts:
+            st.info("No prompts match the current filter.")
+        else:
+            for p_item in display_prompts:
+                p_id = p_item["id"]
+                c_chk, c_text, c_tag, c_del = st.columns([0.6, 5, 2, 0.8])
+                with c_chk:
+                    is_active = st.checkbox(
+                        "Active",
+                        value=bool(p_item["active"]),
+                        key=f"p_act_{p_id}",
+                        label_visibility="collapsed"
+                    )
+                    if is_active != bool(p_item["active"]):
+                        toggle_prompt_active(p_id, is_active)
+                        st.rerun()
+                with c_text:
+                    st.write(p_item["text"])
+                with c_tag:
+                    st.caption(f"🏷️ `{p_item['tag']}`")
+                with c_del:
+                    if st.button("🗑️", key=f"p_del_{p_id}", help="Delete prompt"):
+                        delete_prompt(p_id)
+                        st.rerun()
+
+        # Delete / manage project
+        with st.expander("⚙️ Project settings"):
+            col_edit_b, col_edit_i = st.columns(2)
+            with col_edit_b:
+                edit_brand_val = st.text_input("Brand", value=active_project["brand_name"], key="edit_proj_brand")
+            with col_edit_i:
+                edit_ind_val = st.text_input("Industry", value=active_project.get("industry") or "", key="edit_proj_ind")
+            if st.button("Save project details", key="btn_save_proj_meta"):
+                update_project(
+                    project_id=lib_proj_id,
+                    brand_name=edit_brand_val.strip(),
+                    aliases=active_project.get("aliases"),
+                    industry=edit_ind_val.strip() if edit_ind_val.strip() else None
+                )
+                st.success("Project updated.")
+                st.rerun()
+
+            st.markdown("---")
+            if st.button("🚨 Delete project and prompts", key="btn_delete_proj"):
+                delete_project(lib_proj_id)
+                st.session_state.selected_project_id = None
+                st.success("Project deleted.")
+                st.rerun()
+
+
+# ==========================================
+# TAB 3: HISTORY
 # ==========================================
 with tab_history:
     st.markdown("### Scan history")
+    st.caption("ℹ️ History is stored on the server and can reset when the app restarts. Download a CSV or backup to keep it.")
+
+    col_bk1, col_bk2 = st.columns([1, 1])
+    with col_bk1:
+        db_bytes = get_database_bytes()
+        st.download_button(
+            label="Download database backup (.db)",
+            data=db_bytes,
+            file_name="visibility_tracker_backup.db",
+            mime="application/x-sqlite3",
+            help="Download the full SQLite database file to your local computer."
+        )
+    with col_bk2:
+        uploaded_backup = st.file_uploader(
+            "Restore from backup (.db)",
+            type=["db", "sqlite", "sqlite3"],
+            help="Upload a valid database backup to restore past scans.",
+            label_visibility="collapsed"
+        )
+        if uploaded_backup is not None:
+            if st.button("Apply database restore"):
+                try:
+                    restore_database_from_bytes(uploaded_backup.getvalue())
+                    st.success("Database restored successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to restore database: {e}")
+
     scans = get_all_scans()
 
     if not scans:
@@ -1654,6 +2502,7 @@ with tab_history:
 # ==========================================
 with tab_compare:
     st.markdown("### Visibility over time")
+    st.caption("ℹ️ History is stored on the server and can reset when the app restarts. Download a CSV or backup to keep it.")
     scans = get_all_scans()
 
     if not scans:
@@ -1767,3 +2616,11 @@ with tab_compare:
                 f'{escape_text(chosen_brand)}.</p>',
                 unsafe_allow_html=True
             )
+except Exception as e:
+    exc_type = type(e).__name__
+    logger.exception("Unexpected error in main app body")
+    st.error(
+        f"**Application Error ({exc_type})**\n\n"
+        "An unexpected error occurred while rendering the page. "
+        "Please check your configuration or reload the application."
+    )
