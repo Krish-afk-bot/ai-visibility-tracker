@@ -1456,7 +1456,6 @@ with st.sidebar:
             "```toml\n"
             "# Groq Cloud free tier\n"
             'GROQ_API_KEY = "gsk_..."\n'
-            'GROQ_MODELS = "llama-3.1-8b-instant"\n\n'
             "# Dedicated analyzer\n"
             'ANALYZER_MODEL = "groq:llama-3.1-8b-instant"\n'
             "```"
@@ -1473,10 +1472,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-try:
-    tab_scan, tab_report, tab_library, tab_history, tab_compare = st.tabs([
-        "Current scan",
-        "Brand report",
         "Prompt library",
         "Scan history",
         "Trends"
