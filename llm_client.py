@@ -329,3 +329,95 @@ def query_ai(
             raise LLMClientError(f"Unexpected error communicating with {provider}:{model}: {str(e)}") from e
 
     raise LLMClientError(f"Failed to query {provider}:{model}: {str(last_error)}")
+
+
+# Smallest useful prompt for checking that the analyzer is reachable at all.
+ANALYZER_PROBE_PROMPT = "Reply with the single word: OK"
+
+
+def summarize_analyzer_error(error: Exception) -> str:
+    """Return a short, user-facing reason for an analyzer failure."""
+    if isinstance(error, ConfigurationError):
+        return "Missing API key or unsupported analyzer provider."
+    if isinstance(error, ModelUnavailableError):
+        return "Analyzer model is unavailable, retired, or not found."
+    if isinstance(error, RateLimitExceededError):
+        return "Analyzer is rate limited (quota exhausted)."
+
+    text = " ".join(str(error).split())
+    if not text:
+        text = error.__class__.__name__
+    if len(text) > 160:
+        text = text[:157].rstrip() + "..."
+    return text
+
+
+def probe_analyzer_model(analyzer_model: Optional[str]) -> Dict[str, Any]:
+    """Make one tiny test call to the analyzer before a scan spends quota.
+
+    Returns a dict with:
+        ok: bool
+        reason: short failure reason (None on success)
+        model: the analyzer model string that was tested
+        latency_ms: elapsed time of the probe call (or None if never attempted)
+        response_excerpt: first characters of the reply (None on failure)
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "reason": None,
+        "model": analyzer_model,
+        "latency_ms": None,
+        "response_excerpt": None,
+    }
+
+    if not analyzer_model or not str(analyzer_model).strip():
+        result["reason"] = "ANALYZER_MODEL is not set."
+        return result
+
+    model_str = str(analyzer_model).strip()
+    result["model"] = model_str
+
+    try:
+        provider, model = parse_provider_model(model_str)
+    except ValueError:
+        result["reason"] = f"Invalid ANALYZER_MODEL '{model_str}'. Use 'provider:model'."
+        return result
+
+    if provider not in BASE_URLS:
+        result["reason"] = f"Unsupported analyzer provider '{provider}'."
+        return result
+
+    started = time.monotonic()
+    try:
+        raw_output = query_ai(
+            ANALYZER_PROBE_PROMPT,
+            provider,
+            model,
+            max_retries=0,
+            temperature=0.0,
+        )
+    except Exception as e:  # A health probe must never crash the app.
+        result["latency_ms"] = int((time.monotonic() - started) * 1000)
+        result["reason"] = summarize_analyzer_error(e)
+        return result
+
+    result["ok"] = True
+    result["latency_ms"] = int((time.monotonic() - started) * 1000)
+    result["response_excerpt"] = " ".join((raw_output or "").split())[:80] or None
+    return result
+
+
+def analyzer_health_gate_message(health: Optional[Dict[str, Any]], confirmed: bool) -> Optional[str]:
+    """Explain why a scan is paused until the user confirms the analyzer risk.
+
+    Returns None when the scan may proceed.
+    """
+    if confirmed:
+        return None
+    if not health or health.get("ok"):
+        return None
+    reason = health.get("reason") or "the analyzer did not respond"
+    return (
+        f"Analyzer check failed: {reason} "
+        "Confirm in the sidebar to spend quota on this scan anyway."
+    )
