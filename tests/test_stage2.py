@@ -245,15 +245,15 @@ def test_compute_brand_report_metrics_exclusions_and_sov():
     assert metrics["failed_calls"] == 1
     assert metrics["unique_prompts_count"] == 3
 
-    # HubSpot mentions: 1 (call 1) + 2 (call 2) = 3 mentions
-    # Salesforce mentions: 1 + 1 + 1 = 3 mentions
-    # Pipedrive mentions: 1
-    # Zoho mentions: 1
-    # Total mentions = 3 (HubSpot) + 3 (Salesforce) + 1 (Pipedrive) + 1 (Zoho) = 8
-    # Share of voice = 3 / 8 = 37.5%
-    assert metrics["target_brand_mentions"] == 3
-    assert metrics["total_all_mentions"] == 8
-    assert metrics["share_of_voice_pct"] == 37.5
+    # Share of voice is measured in answers, not word occurrences:
+    # HubSpot is named in 2 answers (call 1, call 2) even though call 2 repeats it twice.
+    # Salesforce is named in 3 answers, Pipedrive in 1, Zoho in 1.
+    # Every successful answer names HubSpot or a competitor, so n = 3.
+    # Share of voice = 2 / 3 = 66.7%
+    assert metrics["target_brand_mentions"] == 2
+    assert metrics["answers_naming_any_tracked_brand"] == 3
+    assert metrics["sov_n"] == 3
+    assert metrics["share_of_voice_pct"] == 66.7
 
     # Sentiment distribution
     assert metrics["sentiment_counts"]["positive"] == 2
@@ -270,10 +270,16 @@ def test_compute_brand_report_metrics_exclusions_and_sov():
     # Average position: (1 + 2) / 2 = 1.5
     assert target_row["avg_position"] == 1.5
 
-    # Top competitor: Salesforce (mentioned in 3 of 3 answers = 100%)
+    # Comparison shares use the same answer unit as the target brand.
+    assert target_row["mentions"] == 2
+    assert target_row["share_of_mentions_pct"] == 66.7
+
+    # Top competitor: Salesforce (named in 3 of 3 answers = 100%)
     sf_row = [r for r in table if r["brand"] == "Salesforce"][0]
     assert sf_row["coverage_pct"] == 100.0
     assert sf_row["answers_with_mention"] == 3
+    assert sf_row["mentions"] == 3
+    assert sf_row["share_of_mentions_pct"] == 100.0
 
     # Coverage over time: 2 distinct scans (scan 1 and scan 2)
     assert metrics["scans_count"] == 2
