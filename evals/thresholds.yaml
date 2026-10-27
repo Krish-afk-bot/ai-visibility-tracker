@@ -1,0 +1,5 @@
+# Minimum acceptable scores for CI gate
+mention_f1: 0.95
+position_within1: 0.80
+competitor_fallback_f1: 0.70
+sentiment_accuracy: 0.70
