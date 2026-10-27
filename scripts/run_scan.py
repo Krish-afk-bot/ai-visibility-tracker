@@ -128,7 +128,12 @@ def run_scheduled_scan(
     logger.info(f"Planned queries: {total_planned} calls (Cap: {call_cap})")
 
     # 6. Initialize scan in DB
-    scan_id = create_scan(brand_name=brand_name, industry=industry, project_id=proj_id)
+    scan_id = create_scan(
+        brand_name=brand_name,
+        industry=industry,
+        project_id=proj_id,
+        expected_calls=total_planned,
+    )
     logger.info(f"Created scan ID {scan_id} in database.")
 
     results = []
@@ -184,16 +189,21 @@ def run_scheduled_scan(
                     ai_response=ai_response,
                     brand_name=brand_name,
                     analyzer_model=analyzer_model,
-                    brand_mentioned=brand_mentioned
+                    brand_mentioned=brand_mentioned,
+                    aliases=aliases,
                 )
                 sentiment = analysis.get("sentiment", "neutral")
                 competitors = analysis.get("competitors", [])
+                analyzer_status = analysis.get("analyzer_status", "ok")
+                analyzer_error = analysis.get("analyzer_error")
             else:
                 brand_mentioned = False
                 mention_count = 0
                 position = None
                 sentiment = "neutral"
                 competitors = []
+                analyzer_status = "ok"
+                analyzer_error = None
 
             # Save result row to DB
             save_result(
@@ -209,7 +219,9 @@ def run_scheduled_scan(
                 run_index=1,
                 status=status,
                 error=error_msg,
-                position=position
+                position=position,
+                analyzer_status=analyzer_status,
+                analyzer_error=analyzer_error,
             )
 
             results.append({
