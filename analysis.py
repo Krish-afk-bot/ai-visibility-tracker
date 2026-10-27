@@ -166,7 +166,8 @@ def analyze_sentiment_and_competitors(
     brand_name: str,
     analyzer_model: str,
     brand_mentioned: bool = True,
-    known_competitors: Optional[List[str]] = None
+    known_competitors: Optional[List[str]] = None,
+    aliases: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """Single LLM call to extract sentiment and competitor brands, saving free-tier quota.
     
@@ -226,12 +227,22 @@ Instructions:
                 raw_comps = []
 
             cleaned_comps = []
-            brand_lower = brand_name.lower().strip()
+            blocked = {brand_name.lower().strip()}
+            if aliases:
+                blocked.update(a.strip().lower() for a in aliases if a and a.strip())
             for c in raw_comps:
                 if isinstance(c, str):
                     c_clean = c.strip()
-                    if c_clean and c_clean.lower() != brand_lower and c_clean.lower() not in [x.lower() for x in cleaned_comps]:
+                    if c_clean and c_clean.lower() not in blocked and c_clean.lower() not in [x.lower() for x in cleaned_comps]:
                         cleaned_comps.append(c_clean)
+
+            # A valid JSON reply can still name no competitors. Fall back to
+            # deterministic extraction so a successful answer never silently
+            # reports "no competitors" when the text clearly names some.
+            if not cleaned_comps:
+                cleaned_comps = fallback_extract_competitors(
+                    ai_response, brand_name, known_competitors, aliases
+                )
 
             return {
                 "sentiment": sentiment if brand_mentioned else "neutral",
@@ -244,7 +255,7 @@ Instructions:
             logger.warning(f"{err_msg}. Raw: {raw_output[:120]}")
             return {
                 "sentiment": "unknown",
-                "competitors": fallback_extract_competitors(ai_response, brand_name, known_competitors),
+                "competitors": fallback_extract_competitors(ai_response, brand_name, known_competitors, aliases),
                 "analyzer_status": "failed",
                 "analyzer_error": err_msg
             }
@@ -253,31 +264,165 @@ Instructions:
         logger.error(f"Error querying analyzer model {analyzer_model}: {err_msg}")
         return {
             "sentiment": "unknown",
-            "competitors": fallback_extract_competitors(ai_response, brand_name, known_competitors),
+            "competitors": fallback_extract_competitors(ai_response, brand_name, known_competitors, aliases),
             "analyzer_status": "failed",
             "analyzer_error": err_msg
         }
 
 
+# Generic table headers and filler that must never be reported as a competitor.
+GENERIC_COMPETITOR_TERMS = {
+    "brand", "brands", "company", "companies", "product", "products",
+    "tool", "tools", "platform", "platforms", "software", "service",
+    "services", "vendor", "vendors", "option", "options", "alternative",
+    "alternatives", "competitor", "competitors", "feature", "features",
+    "price", "pricing", "cost", "costs", "pros", "cons", "rating",
+    "ratings", "score", "scores", "best", "top", "name", "summary",
+    "details", "description", "overview", "category", "type", "website",
+    "link", "notes", "note", "verdict", "recommendation", "reason",
+    "reasoning", "strength", "strengths", "weakness", "weaknesses",
+    "use case", "use cases", "free tier", "trial", "yes", "no", "n/a",
+    "na", "none", "other", "others", "model", "models", "tool name",
+    "product name", "company name", "platform name", "key features",
+    "bottom line", "why it stands out", "best for", "starting price",
+}
+
+MAX_FALLBACK_COMPETITORS = 20
+
+
+def _clean_extracted_name(raw_name: str) -> str:
+    """Strip markdown emphasis, links, and table punctuation from a candidate name."""
+    name = (raw_name or "").strip()
+    if not name:
+        return ""
+    # Links: [Name](https://...)
+    name = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", name)
+    name = name.replace("**", "").replace("__", "").replace("`", "")
+    name = name.strip(" \t|:;,.(-)")
+    name = re.sub(r"\s+", " ", name)
+    return name.strip()
+
+
+def _is_valid_competitor_name(
+    name: str,
+    brand_name: str,
+    aliases: Optional[List[str]] = None
+) -> bool:
+    """Reject generic labels, the target brand, links, and non-name fragments."""
+    if not name:
+        return False
+    if name.lower() in GENERIC_COMPETITOR_TERMS:
+        return False
+    if "http://" in name.lower() or "https://" in name.lower() or "www." in name.lower():
+        return False
+    if re.fullmatch(r"[\d\s.,%#/-]+", name):
+        return False
+    if len(name) < 2 or len(name) > 60:
+        return False
+    if len(name.split()) > 4:
+        return False
+
+    blocked = {brand_name.strip().lower()} if brand_name and brand_name.strip() else set()
+    if aliases:
+        blocked.update(a.strip().lower() for a in aliases if a and a.strip())
+    return name.lower() not in blocked
+
+
+def extract_markdown_table_first_column(text: str) -> List[str]:
+    """Return the first column of every markdown table data row.
+
+    Header rows (the row directly above a separator) and separator rows are
+    skipped, so table labels like "Brand" or "Tool" never become competitors.
+    """
+    if not text:
+        return []
+
+    names: List[str] = []
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("|") or "|" not in stripped.strip("|"):
+            continue
+
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if not cells:
+            continue
+        first = cells[0]
+        if re.fullmatch(r":?-{2,}:?", first):
+            continue
+
+        next_line = lines[idx + 1] if idx + 1 < len(lines) else ""
+        if re.fullmatch(r"\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*", next_line):
+            continue  # This row is the table header.
+
+        cleaned = _clean_extracted_name(first)
+        if cleaned:
+            names.append(cleaned)
+    return names
+
+
+def extract_bold_competitor_names(text: str) -> List[str]:
+    """Return names emphasized in bold, e.g. "**Asana** offers ..."."""
+    if not text:
+        return []
+    return [
+        cleaned
+        for cleaned in (_clean_extracted_name(m) for m in re.findall(r"\*\*(.+?)\*\*", text))
+        if cleaned and cleaned.lower() not in GENERIC_COMPETITOR_TERMS
+    ]
+
+
 def fallback_extract_competitors(
     ai_response: str,
     brand_name: str,
-    known_competitors: Optional[List[str]] = None
+    known_competitors: Optional[List[str]] = None,
+    aliases: Optional[List[str]] = None
 ) -> List[str]:
-    """Deterministic fallback to find known competitors in text if LLM call fails."""
-    detected = []
-    brand_lower = brand_name.lower().strip()
-    if known_competitors:
-        for comp in known_competitors:
-            comp_clean = comp.strip()
-            if not comp_clean or comp_clean.lower() == brand_lower:
-                continue
-            esc = re.escape(comp_clean)
-            pref = r"\b" if re.match(r"^\w", comp_clean) else r"(?:^|\s)"
-            suff = r"\b" if re.search(r"\w$", comp_clean) else r"(?:$|\s)"
-            if re.search(rf"{pref}{esc}{suff}", ai_response, re.IGNORECASE):
-                if comp_clean.lower() not in [d.lower() for d in detected]:
-                    detected.append(comp_clean)
+    """Deterministic competitor extraction used when the analyzer fails or is empty.
+
+    1. Every configured "Known competitor" found with word boundaries.
+    2. First columns of markdown tables (header/separator rows skipped).
+    3. Bold names.
+    Generic labels such as "Brand", "Tool", or "Best for" are dropped, and the
+    target brand and its aliases are never reported as competitors.
+    """
+    if not ai_response or not ai_response.strip():
+        return []
+
+    detected: List[str] = []
+    seen = set()
+
+    def add(candidate: str, require_boundary: bool = False) -> None:
+        cleaned = _clean_extracted_name(candidate)
+        if not _is_valid_competitor_name(cleaned, brand_name, aliases):
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        if require_boundary:
+            esc = re.escape(cleaned)
+            pref = r"\b" if re.match(r"^\w", cleaned) else r"(?:^|\s)"
+            suff = r"\b" if re.search(r"\w$", cleaned) else r"(?:$|\s)"
+            if not re.search(rf"{pref}{esc}{suff}", ai_response, re.IGNORECASE):
+                return
+        if len(detected) >= MAX_FALLBACK_COMPETITORS:
+            return
+        seen.add(key)
+        detected.append(cleaned)
+
+    brand_lower = brand_name.strip().lower() if brand_name else ""
+    for comp in known_competitors or []:
+        comp_clean = (comp or "").strip()
+        if not comp_clean or comp_clean.lower() == brand_lower:
+            continue
+        add(comp_clean, require_boundary=True)
+
+    for table_name in extract_markdown_table_first_column(ai_response):
+        add(table_name)
+
+    for bold_name in extract_bold_competitor_names(ai_response):
+        add(bold_name)
+
     return detected
 
 
@@ -504,28 +649,93 @@ def generate_comparison_summary(model_scores: Dict[str, Dict[str, Any]]) -> str:
     return summary_str
 
 
+ANALYZER_INCOMPLETE_THRESHOLD = 0.30
+
+
+def coerce_competitor_list(raw: Any) -> List[str]:
+    """Return a clean list of competitor names from a stored value.
+
+    Accepts lists or JSON-encoded strings (the database stores JSON text).
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except Exception:
+            return []
+    if not isinstance(raw, (list, tuple)):
+        return []
+
+    names: List[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            name = item.strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def is_analysis_incomplete(
+    failed_answers: int,
+    total_answers: int,
+    threshold: float = ANALYZER_INCOMPLETE_THRESHOLD
+) -> bool:
+    """True when the analyzer failed for more than `threshold` of the answers."""
+    if total_answers <= 0:
+        return False
+    return (failed_answers / total_answers) > threshold
+
+
+def incomplete_analysis_message(failed_answers: int, total_answers: int) -> str:
+    """Exact banner text used when competitor/sentiment data cannot be trusted."""
+    return (
+        f"Competitor and sentiment data is incomplete "
+        f"({failed_answers} of {total_answers} answers). Fix the analyzer and rerun."
+    )
+
+
 def compute_brand_report_metrics(
     results: List[Dict[str, Any]],
     target_brand: str,
     top_competitors_count: int = 5
 ) -> Dict[str, Any]:
     """Compute aggregated Brand Report metrics for a chosen brand vs. competitors.
-    
-    All metrics strictly exclude failed language model calls and report failed count.
-    
+
+    Units are answers, not word occurrences: a brand is counted once per
+    successful language model answer that names it. Failed language model calls
+    are excluded and reported separately.
+
+    When the analyzer failed for more than 30% of successful answers, the
+    competitor-derived metrics (share of voice, competitor shares) are marked
+    unavailable instead of silently reporting a 100% share.
+
     Returns:
         {
             "total_answers": int,
             "successful_answers": int,
             "failed_calls": int,
             "unique_prompts_count": int,
-            "share_of_voice_pct": float,
-            "target_brand_mentions": int,
-            "total_all_mentions": int,
+            "analyzer_failures": int,
+            "analyzed_answers": int,
+            "analysis_incomplete": bool,
+            "analysis_incomplete_message": Optional[str],
+            "share_of_voice_pct": Optional[float],
+            "sov_available": bool,
+            "sov_n": int,                      # answers naming any tracked brand
+            "target_brand_mentions": int,      # answers naming the target brand
+            "answers_naming_any_tracked_brand": int,
+            "total_all_mentions": int,         # legacy alias for the union above
             "sentiment_counts": {"positive": int, "neutral": int, "negative": int, "unknown": int},
-            "comparison_table": List[Dict[str, Any]], # [target_brand, comp1, comp2, ...]
-            "coverage_over_time": List[Dict[str, Any]], # [{scan_id, scan_date, brand, coverage_pct, answers_n}]
-            "top_competitors": List[str]
+            "sentiment_evaluated": int,
+            "sentiment_available": bool,
+            "comparison_table": List[Dict[str, Any]],
+            "coverage_over_time": List[Dict[str, Any]],
+            "top_competitors": List[str],
+            "scans_count": int
         }
     """
     failed_calls = sum(1 for r in results if r.get("status") == "failed")
@@ -534,114 +744,119 @@ def compute_brand_report_metrics(
 
     unique_prompts = list(dict.fromkeys([r.get("prompt") for r in results if r.get("prompt")]))
 
-    # Target brand sentiment distribution over successful calls
-    sentiment_counts = {"positive": 0, "neutral": 0, "negative": 0, "unknown": 0}
-    for r in successful:
-        if r.get("brand_mentioned"):
-            sent = str(r.get("sentiment") or "neutral").lower()
-            if sent not in sentiment_counts:
-                sent = "unknown"
-            sentiment_counts[sent] += 1
+    # ---- Analyzer coverage (answer unit) ----
+    analyzer_failures = sum(
+        1 for r in successful if (r.get("analyzer_status") or "ok") == "failed"
+    )
+    analyzed_answers = total_successful - analyzer_failures
+    analysis_incomplete = is_analysis_incomplete(analyzer_failures, total_successful)
+    analysis_message = (
+        incomplete_analysis_message(analyzer_failures, total_successful)
+        if analysis_incomplete else None
+    )
 
-    # Brand stats aggregation
     brand_norm = target_brand.strip().lower()
-    
-    # 1. Target brand mentions & coverage
-    target_mentions = 0
+
+    sentiment_counts = {"positive": 0, "neutral": 0, "negative": 0, "unknown": 0}
+    sentiment_evaluated = 0
+
     target_answers_with_mention = 0
-    target_positions = []
-    
-    for r in successful:
+    target_positions: List[float] = []
+    answers_naming_any = set()
+
+    competitor_answers: Counter = Counter()
+
+    for idx, r in enumerate(successful):
+        competitors = coerce_competitor_list(r.get("competitors"))
+        unique_in_answer = {}
+        for c in competitors:
+            key = c.strip().lower()
+            if not key or key == brand_norm:
+                continue
+            unique_in_answer.setdefault(key, c.strip())
+
+        if unique_in_answer:
+            answers_naming_any.add(idx)
+            for name in unique_in_answer.values():
+                competitor_answers[name] += 1
+
         if r.get("brand_mentioned"):
-            target_mentions += max(1, r.get("mention_count") or 1)
+            answers_naming_any.add(idx)
             target_answers_with_mention += 1
+
             if r.get("position") is not None:
                 try:
                     target_positions.append(float(r["position"]))
                 except (ValueError, TypeError):
                     pass
 
-    # 2. Competitors aggregation from stored competitor lists
-    competitor_mentions_counter = Counter()
-    competitor_answers_counter = Counter()
-    competitor_positions = {}
-    
-    for r in successful:
-        comps = r.get("competitors") or []
-        if isinstance(comps, str):
-            try:
-                comps = json.loads(comps)
-            except Exception:
-                comps = []
-        
-        seen_in_row = set()
-        for c in comps:
-            if not isinstance(c, str):
-                continue
-            c_clean = c.strip()
-            if not c_clean or c_clean.lower() == brand_norm:
-                continue
-            
-            competitor_mentions_counter[c_clean] += 1
-            
-            if c_clean.lower() not in seen_in_row:
-                seen_in_row.add(c_clean.lower())
-                competitor_answers_counter[c_clean] += 1
+            if (r.get("analyzer_status") or "ok") != "failed":
+                sent = str(r.get("sentiment") or "neutral").lower()
+                if sent not in sentiment_counts:
+                    sent = "unknown"
+                sentiment_counts[sent] += 1
+                sentiment_evaluated += 1
 
-    # Top competitors by frequency
-    top_comps = [c for c, _ in competitor_mentions_counter.most_common(top_competitors_count)]
+    sov_n = len(answers_naming_any)
+    sov_available = (not analysis_incomplete) and sov_n > 0
+    sov_pct = (
+        round(target_answers_with_mention / sov_n * 100.0, 1)
+        if sov_available else None
+    )
 
-    # Total brand mentions across ALL brands (target brand + all competitors)
-    total_all_mentions = target_mentions + sum(competitor_mentions_counter.values())
+    top_comps = [c for c, _ in competitor_answers.most_common(top_competitors_count)]
 
-    # Share of voice for target brand
-    sov_pct = (target_mentions / total_all_mentions * 100.0) if total_all_mentions > 0 else 0.0
-
-    # Build comparison rows for chosen brand + top competitors
+    # Build comparison rows for chosen brand + top competitors (same answer unit).
     comparison_table = []
 
-    # Target brand row
-    target_cov_pct = (target_answers_with_mention / total_successful * 100.0) if total_successful > 0 else 0.0
-    target_share_of_mentions = (target_mentions / total_all_mentions * 100.0) if total_all_mentions > 0 else 0.0
+    target_cov_pct = (
+        target_answers_with_mention / total_successful * 100.0
+        if total_successful > 0 else 0.0
+    )
+    target_share_answers = (
+        round(target_answers_with_mention / sov_n * 100.0, 1)
+        if sov_n > 0 and not analysis_incomplete else None
+    )
     target_avg_pos = (sum(target_positions) / len(target_positions)) if target_positions else None
 
     comparison_table.append({
         "brand": target_brand,
         "is_target": True,
-        "mentions": target_mentions,
-        "share_of_mentions_pct": target_share_of_mentions,
+        "mentions": target_answers_with_mention,
+        "share_of_mentions_pct": target_share_answers,
         "coverage_pct": target_cov_pct,
         "answers_with_mention": target_answers_with_mention,
         "total_answers": total_successful,
         "avg_position": target_avg_pos,
     })
 
-    # Competitor rows
     for comp in top_comps:
-        c_mentions = competitor_mentions_counter[comp]
-        c_answers = competitor_answers_counter[comp]
+        c_answers = competitor_answers[comp]
         c_cov_pct = (c_answers / total_successful * 100.0) if total_successful > 0 else 0.0
-        c_share_mentions = (c_mentions / total_all_mentions * 100.0) if total_all_mentions > 0 else 0.0
-        
+        c_share_answers = (
+            round(c_answers / sov_n * 100.0, 1)
+            if sov_n > 0 and not analysis_incomplete else None
+        )
+
         comparison_table.append({
             "brand": comp,
             "is_target": False,
-            "mentions": c_mentions,
-            "share_of_mentions_pct": c_share_mentions,
+            "mentions": c_answers,
+            "share_of_mentions_pct": c_share_answers,
             "coverage_pct": c_cov_pct,
             "answers_with_mention": c_answers,
             "total_answers": total_successful,
-            "avg_position": None,  # Extracted from free text competitors
+            "avg_position": None,  # Not derivable from free-text competitor names
         })
 
-    # Mark ties in coverage % and average position
+    # Mark ties in coverage %
     cov_values = [round(row["coverage_pct"], 1) for row in comparison_table]
     cov_counts = Counter(cov_values)
     for row in comparison_table:
         val = round(row["coverage_pct"], 1)
         row["is_tied_coverage"] = cov_counts[val] > 1
 
-    # Coverage over time (per scan_id or scan_created_at)
+    # Coverage over time (per scan_id or scan date)
     scans_grouped = {}
     for r in successful:
         s_id = r.get("scan_id") or "scan"
@@ -652,14 +867,13 @@ def compute_brand_report_metrics(
         scans_grouped[key].append(r)
 
     coverage_over_time = []
-    # All brands to track over time
     all_tracked_brands = [target_brand] + top_comps
 
     for (s_id, s_date), s_rows in sorted(scans_grouped.items(), key=lambda x: str(x[0][1])):
         s_total = len(s_rows)
         if s_total == 0:
             continue
-        
+
         for b_name in all_tracked_brands:
             b_is_target = (b_name.lower().strip() == brand_norm)
             if b_is_target:
@@ -667,10 +881,10 @@ def compute_brand_report_metrics(
             else:
                 b_mentions_count = 0
                 for row in s_rows:
-                    comps = row.get("competitors") or []
-                    if any(isinstance(c, str) and c.lower().strip() == b_name.lower().strip() for c in comps):
+                    comps = coerce_competitor_list(row.get("competitors"))
+                    if any(c.lower().strip() == b_name.lower().strip() for c in comps):
                         b_mentions_count += 1
-            
+
             cov = (b_mentions_count / s_total * 100.0)
             coverage_over_time.append({
                 "scan_id": s_id,
@@ -687,14 +901,69 @@ def compute_brand_report_metrics(
         "successful_answers": total_successful,
         "failed_calls": failed_calls,
         "unique_prompts_count": len(unique_prompts),
-        "share_of_voice_pct": round(sov_pct, 1),
-        "target_brand_mentions": target_mentions,
-        "total_all_mentions": total_all_mentions,
+        "analyzer_failures": analyzer_failures,
+        "analyzed_answers": analyzed_answers,
+        "analysis_incomplete": analysis_incomplete,
+        "analysis_incomplete_message": analysis_message,
+        "share_of_voice_pct": sov_pct,
+        "sov_available": sov_available,
+        "sov_n": sov_n,
+        "target_brand_mentions": target_answers_with_mention,
+        "answers_naming_any_tracked_brand": sov_n,
+        "total_all_mentions": sov_n,
         "sentiment_counts": sentiment_counts,
+        "sentiment_evaluated": sentiment_evaluated,
+        "sentiment_available": (not analysis_incomplete) and sentiment_evaluated > 0,
         "comparison_table": comparison_table,
         "coverage_over_time": coverage_over_time,
         "top_competitors": top_comps,
         "scans_count": len(scans_grouped)
+    }
+
+
+def count_result_statuses(results: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Count completed and failed calls in a scan result list."""
+    completed = sum(1 for r in results if r.get("status") == "ok")
+    failed = sum(1 for r in results if r.get("status") == "failed")
+    return {"completed": completed, "failed": failed, "total": len(results)}
+
+
+def compute_call_accounting(
+    expected_calls: Optional[int],
+    completed_calls: int,
+    failed_calls: int
+) -> Dict[str, Any]:
+    """Reconcile expected scan calls (prompts x models x runs) with recorded rows.
+
+    Returns expected/completed/failed/missing counts and a warning string when
+    completed + failed does not equal expected.
+    """
+    expected = max(0, int(expected_calls or 0))
+    completed = max(0, int(completed_calls or 0))
+    failed = max(0, int(failed_calls or 0))
+    accounted = completed + failed
+    missing = max(0, expected - accounted)
+    extra = max(0, accounted - expected)
+    reconciles = expected == accounted
+
+    warning = None
+    if not reconciles:
+        warning = (
+            f"Call accounting does not reconcile: expected {expected} calls "
+            f"(prompts x models x runs), but {accounted} were recorded "
+            f"({completed} completed, {failed} failed, {missing} missing"
+            f"{f', {extra} unexpected' if extra else ''})."
+        )
+
+    return {
+        "expected": expected,
+        "completed": completed,
+        "failed": failed,
+        "missing": missing,
+        "extra": extra,
+        "accounted": accounted,
+        "reconciles": reconciles,
+        "warning": warning,
     }
 
 
@@ -745,12 +1014,7 @@ def find_visibility_gaps(
             else:
                 models_omitting_brand.add(pm)
 
-            comps = r.get("competitors") or []
-            if isinstance(comps, str):
-                try:
-                    comps = json.loads(comps)
-                except Exception:
-                    comps = []
+            comps = coerce_competitor_list(r.get("competitors"))
 
             for c in comps:
                 if isinstance(c, str):
@@ -761,8 +1025,8 @@ def find_visibility_gaps(
 
         answers_with_any_competitor = sum(
             1 for r in p_rows if any(
-                isinstance(c, str) and c.strip().lower() != brand_norm
-                for c in (r.get("competitors") or [])
+                c.strip().lower() != brand_norm
+                for c in coerce_competitor_list(r.get("competitors"))
             )
         )
         comp_cov_pct = (answers_with_any_competitor / total_answers * 100.0)
