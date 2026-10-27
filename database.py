@@ -119,10 +119,12 @@ def init_db(db_path: Optional[str] = None) -> None:
             )
         """)
         
-        # Safe migration for scans (project_id)
+        # Safe migration for scans (project_id, expected_calls)
         existing_scan_cols = _get_table_columns(conn, "scans")
         if "project_id" not in existing_scan_cols:
             cursor.execute("ALTER TABLE scans ADD COLUMN project_id INTEGER REFERENCES projects(id)")
+        if "expected_calls" not in existing_scan_cols:
+            cursor.execute("ALTER TABLE scans ADD COLUMN expected_calls INTEGER")
 
         # 4. scan_results table (base structure)
         cursor.execute("""
@@ -150,6 +152,8 @@ def init_db(db_path: Optional[str] = None) -> None:
             ("status", "TEXT DEFAULT 'ok'"),
             ("error", "TEXT"),
             ("position", "INTEGER"),
+            ("analyzer_status", "TEXT DEFAULT 'ok'"),
+            ("analyzer_error", "TEXT"),
         ]
         
         for col_name, col_def in migrations:
@@ -374,14 +378,19 @@ def create_scan(
     brand_name: str,
     industry: Optional[str] = None,
     project_id: Optional[int] = None,
+    expected_calls: Optional[int] = None,
     db_path: Optional[str] = None
 ) -> int:
-    """Create a new scan record linked optionally to a project."""
+    """Create a new scan record linked optionally to a project.
+
+    `expected_calls` records prompts x models x runs up front so the scan can
+    later prove whether every planned call produced a row.
+    """
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO scans (brand_name, industry, project_id) VALUES (?, ?, ?)",
-            (brand_name, industry, project_id)
+            "INSERT INTO scans (brand_name, industry, project_id, expected_calls) VALUES (?, ?, ?, ?)",
+            (brand_name, industry, project_id, expected_calls)
         )
         scan_id = cursor.lastrowid
         return scan_id
@@ -411,6 +420,8 @@ def save_result(
     status: str = "ok",
     error: Optional[str] = None,
     position: Optional[int] = None,
+    analyzer_status: str = "ok",
+    analyzer_error: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> int:
     """Save a scan result row.
@@ -423,8 +434,9 @@ def save_result(
         cursor.execute(
             """INSERT INTO scan_results 
                (scan_id, prompt, ai_response, brand_mentioned, mention_count, sentiment,
-                competitors, provider, model, run_index, status, error, position)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                competitors, provider, model, run_index, status, error, position,
+                analyzer_status, analyzer_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 scan_id,
                 prompt,
@@ -438,7 +450,9 @@ def save_result(
                 run_index,
                 status,
                 error,
-                position
+                position,
+                analyzer_status or "ok",
+                analyzer_error
             )
         )
         return cursor.lastrowid
@@ -518,6 +532,45 @@ def get_all_scans(project_id: Optional[int] = None, db_path: Optional[str] = Non
         return [dict(row) for row in rows]
 
 
+def get_scan(scan_id: int, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Return one scan record (including expected_calls), or None."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM scans WHERE id = ?", (scan_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_scan_status_counts(db_path: Optional[str] = None) -> Dict[int, Dict[str, int]]:
+    """Return per-scan completed/failed row counts plus an inferred expected total.
+
+    expected_inferred = distinct prompts x distinct models x max run index. It is
+    only a fallback for scans recorded before expected_calls was stored.
+    """
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                scan_id,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN status != 'failed' THEN 1 ELSE 0 END) AS completed,
+                COUNT(DISTINCT prompt)
+                    * COUNT(DISTINCT provider || ':' || model)
+                    * MAX(COALESCE(run_index, 1)) AS expected_inferred
+            FROM scan_results
+            GROUP BY scan_id
+        """)
+        rows = cursor.fetchall()
+        return {
+            row["scan_id"]: {
+                "completed": int(row["completed"] or 0),
+                "failed": int(row["failed"] or 0),
+                "expected_inferred": int(row["expected_inferred"] or 0),
+            }
+            for row in rows
+        }
+
+
 def get_scans_and_results_in_range(
     brand_name: Optional[str] = None,
     project_id: Optional[int] = None,
@@ -534,6 +587,7 @@ def get_scans_and_results_in_range(
                 s.brand_name as scan_brand,
                 s.industry as scan_industry,
                 s.project_id,
+                s.expected_calls,
                 s.created_at as scan_created_at,
                 sr.id as result_id,
                 sr.prompt,
@@ -548,6 +602,8 @@ def get_scans_and_results_in_range(
                 sr.status,
                 sr.error,
                 sr.position,
+                sr.analyzer_status,
+                sr.analyzer_error,
                 p.tag as prompt_tag
             FROM scans s
             JOIN scan_results sr ON s.id = sr.scan_id
