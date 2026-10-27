@@ -19,6 +19,12 @@ load_dotenv(override=True)
 
 import hmac
 from config import get_setting, get_int_setting
+from sample_data import (
+    SAMPLE_BRAND,
+    SAMPLE_DATA_LABEL,
+    load_sample_into_state,
+    resolve_display_brand,
+)
 
 from database import (
     init_db,
@@ -32,6 +38,8 @@ from database import (
     get_scans_and_results_in_range,
     get_database_bytes,
     restore_database_from_bytes,
+    get_scan,
+    get_scan_status_counts,
     create_project,
     get_projects,
     get_project,
@@ -55,6 +63,8 @@ from llm_client import (
     ConfigurationError,
     ModelUnavailableError,
     RateLimitExceededError,
+    probe_analyzer_model,
+    analyzer_health_gate_message,
 )
 from analysis import (
     detect_brand_mention_deterministic,
@@ -67,6 +77,8 @@ from analysis import (
     find_visibility_gaps,
     generate_prompt_ideas,
     generate_gap_recommendation,
+    compute_call_accounting,
+    count_result_statuses,
 )
 
 logger = logging.getLogger(__name__)
@@ -256,10 +268,10 @@ SAMPLE_RESULTS = [
 # Default to sample dashboard on first load
 if "scan_results" not in st.session_state:
     st.session_state.scan_results = SAMPLE_RESULTS
-    st.session_state.scan_brand = "HubSpot"
     st.session_state.is_sample = True
 if "scan_brand" not in st.session_state:
-    st.session_state.scan_brand = "HubSpot"
+    # The demo dataset owns its brand; never seed the sidebar with it.
+    st.session_state.scan_brand = ""
 if "scan_id" not in st.session_state:
     st.session_state.scan_id = None
 if "prompts_text" not in st.session_state:
@@ -276,6 +288,8 @@ if "selected_project_id" not in st.session_state:
     st.session_state.selected_project_id = None
 if "prompt_ideas" not in st.session_state:
     st.session_state.prompt_ideas = []
+if "analyzer_health" not in st.session_state:
+    st.session_state.analyzer_health = None
 
 
 # Helper for running a single query unit (supports parallel execution)
@@ -330,7 +344,8 @@ def execute_query_unit(
             brand_name=brand_name,
             analyzer_model=analyzer_model,
             brand_mentioned=brand_mentioned,
-            known_competitors=known_competitors
+            known_competitors=known_competitors,
+            aliases=aliases
         )
         sentiment = analysis.get("sentiment", "neutral")
         competitors = analysis.get("competitors", [])
@@ -1231,6 +1246,29 @@ with st.sidebar:
     else:
         st.error("ANALYZER_MODEL is not set in .env. Add it to grade sentiment and competitors.")
 
+    # Health is probed with one tiny call before a scan spends quota.
+    analyzer_health = st.session_state.get("analyzer_health")
+    if analyzer_health and analyzer_health.get("model") != analyzer_model:
+        analyzer_health = None
+        st.session_state.analyzer_health = None
+    if analyzer_model and analyzer_health:
+        if analyzer_health.get("ok"):
+            latency = analyzer_health.get("latency_ms")
+            timing = f" in {latency} ms" if latency is not None else ""
+            st.caption(f"✔ Analyzer responded{timing}.")
+        else:
+            st.error(
+                f"Analyzer check failed: "
+                f"{analyzer_health.get('reason') or 'unknown error'}"
+            )
+            st.checkbox(
+                "Run the scan anyway (sentiment and competitor data may be missing)",
+                key="analyzer_override_confirmed",
+            )
+            if st.button("Re-check analyzer", key="btn_recheck_analyzer"):
+                st.session_state.analyzer_health = None
+                st.rerun()
+
     if not available_models:
         st.error("No test models are available. Add provider keys and model IDs to .env.")
         selected_models = []
@@ -1315,6 +1353,21 @@ with st.sidebar:
         elif not is_analyzer_valid:
             st.session_state.validation_error = analyzer_err
         else:
+            # One tiny analyzer call at the start of every scan, before the
+            # scan itself spends quota.
+            with st.spinner("Testing the analyzer with one small call..."):
+                health = probe_analyzer_model(analyzer_model)
+            st.session_state.analyzer_health = health
+            st.session_state.calls_used += 1
+
+            gate_message = analyzer_health_gate_message(
+                health,
+                bool(st.session_state.get("analyzer_override_confirmed")),
+            )
+            if gate_message:
+                st.session_state.validation_error = gate_message
+                st.rerun()
+
             st.session_state.validation_error = None
             st.session_state.scan_brand = brand_clean
             st.session_state.is_sample = False
@@ -1325,7 +1378,8 @@ with st.sidebar:
             scan_id = create_scan(
                 brand_name=brand_clean,
                 industry=industry_input.strip() if industry_input.strip() else None,
-                project_id=current_proj_id
+                project_id=current_proj_id,
+                expected_calls=total_calls
             )
             st.session_state.scan_id = scan_id
 
@@ -1376,7 +1430,9 @@ with st.sidebar:
                         run_index=res["run_index"],
                         status=res["status"],
                         error=res["error"],
-                        position=res["position"]
+                        position=res["position"],
+                        analyzer_status=res.get("analyzer_status", "ok"),
+                        analyzer_error=res.get("analyzer_error")
                     )
 
             # Record non-cached calls against session quota
@@ -1496,9 +1552,7 @@ with tab_scan:
         col_sample, _ = st.columns([1, 3])
         with col_sample:
             if st.button("Load sample dashboard", use_container_width=True):
-                st.session_state.scan_results = SAMPLE_RESULTS
-                st.session_state.scan_brand = "HubSpot"
-                st.session_state.is_sample = True
+                load_sample_into_state(st.session_state, SAMPLE_RESULTS)
                 st.rerun()
 
         st.markdown("### Example prompts")
@@ -1528,8 +1582,9 @@ with tab_scan:
             )
 
     else:
+        is_sample = bool(st.session_state.is_sample)
         results = st.session_state.scan_results
-        brand = st.session_state.scan_brand
+        brand = resolve_display_brand(is_sample, st.session_state.scan_brand)
 
         model_scores = calculate_model_scores(results)
         unique_prompts = list(dict.fromkeys([r["prompt"] for r in results]))
@@ -1541,14 +1596,33 @@ with tab_scan:
         )
         total_failures = sum(1 for r in results if r.get("status") == "failed")
 
+        if is_sample:
+            st.info(SAMPLE_DATA_LABEL)
+
         st.markdown(
             f'<div class="lede">{build_lede(model_scores, brand)}</div>',
             unsafe_allow_html=True
         )
 
         notes = []
-        if st.session_state.is_sample:
-            notes.append("Sample data. No model calls were made.")
+        call_warning = None
+        if not is_sample and st.session_state.scan_id:
+            scan_record = get_scan(st.session_state.scan_id)
+            expected_calls = (scan_record or {}).get("expected_calls")
+            if expected_calls:
+                status_counts = count_result_statuses(results)
+                accounting = compute_call_accounting(
+                    expected_calls,
+                    status_counts["completed"],
+                    status_counts["failed"],
+                )
+                notes.append(
+                    f"Calls: {accounting['expected']} expected, "
+                    f"{accounting['completed']} completed, "
+                    f"{accounting['failed']} failed, "
+                    f"{accounting['missing']} missing."
+                )
+                call_warning = accounting["warning"]
         if total_failures == 1:
             notes.append("1 call failed and is excluded from the ranking.")
         elif total_failures > 1:
@@ -1566,6 +1640,12 @@ with tab_scan:
                 f'<p class="lede-note">{escape_text(" ".join(notes))}</p>',
                 unsafe_allow_html=True
             )
+        if call_warning:
+            st.warning(call_warning)
+        if not is_sample:
+            if st.button("Load sample dashboard", key="btn_load_sample_inline"):
+                load_sample_into_state(st.session_state, SAMPLE_RESULTS)
+                st.rerun()
 
         st.markdown("### Model ranking")
         st.markdown(
@@ -1689,38 +1769,68 @@ with tab_scan:
 
         st.markdown("### Share of voice")
         st.markdown(
-            '<p class="section-note">How often your brand and competitors appear '
-            "in the answers.</p>",
+            '<p class="section-note">The share of answers that name each brand. '
+            "One answer counts once per brand, no matter how often the name appears.</p>",
             unsafe_allow_html=True
         )
 
-        all_comps = []
-        brand_mentions_total = sum(
-            1 for r in results if r["brand_mentioned"] and r["status"] == "ok"
+        successful_results = [r for r in results if r.get("status") == "ok"]
+        analyzer_failure_share = (
+            analyzer_failures / len(successful_results) if successful_results else 0.0
         )
-        for r in results:
-            if r.get("competitors") and isinstance(r["competitors"], list):
-                all_comps.extend(r["competitors"])
-
-        comp_counts = Counter(all_comps)
-        sov_items = [(f"{brand} (you)", brand_mentions_total, True)]
-        for comp_name, count in comp_counts.most_common(10):
-            sov_items.append((comp_name, count, False))
-
-        max_mentions = max([count for _, count, _ in sov_items] + [1])
-        sov_rows = []
-        for name, count, is_brand in sov_items:
-            width = (count / max_mentions) * 100
-            row_class = "sov-row brand" if is_brand else "sov-row"
-            sov_rows.append(
-                f'<div class="{row_class}">'
-                f'<div class="sov-name">{escape_text(name)}</div>'
-                f'<div class="sov-track"><div class="sov-fill" '
-                f'style="width:{width:.1f}%"></div></div>'
-                f'<div class="sov-count">{count}</div>'
-                f'</div>'
+        if analyzer_failure_share > 0.30:
+            st.info(
+                "Not available. Competitor and sentiment data is incomplete "
+                f"({analyzer_failures} of {len(successful_results)} answers). "
+                "Fix the analyzer and rerun."
             )
-        st.markdown('<div class="sov">' + "".join(sov_rows) + "</div>", unsafe_allow_html=True)
+        else:
+            brand_answers_total = sum(
+                1 for r in successful_results if r.get("brand_mentioned")
+            )
+            comp_answer_counts = Counter()
+            answers_naming_any = 0
+            for r in successful_results:
+                comps = r.get("competitors") or []
+                if isinstance(comps, str):
+                    try:
+                        comps = json.loads(comps)
+                    except Exception:
+                        comps = []
+                names = {
+                    c.strip() for c in comps
+                    if isinstance(c, str)
+                    and c.strip()
+                    and c.strip().lower() != brand.lower().strip()
+                }
+                if names or r.get("brand_mentioned"):
+                    answers_naming_any += 1
+                for name in names:
+                    comp_answer_counts[name] += 1
+
+            sov_items = [(f"{brand} (you)", brand_answers_total, True)]
+            for comp_name, count in comp_answer_counts.most_common(10):
+                sov_items.append((comp_name, count, False))
+
+            max_answers = max([count for _, count, _ in sov_items] + [1])
+            sov_rows = []
+            for name, count, is_brand in sov_items:
+                width = (count / max_answers) * 100
+                pct = (count / answers_naming_any * 100.0) if answers_naming_any else 0.0
+                row_class = "sov-row brand" if is_brand else "sov-row"
+                sov_rows.append(
+                    f'<div class="{row_class}">'
+                    f'<div class="sov-name">{escape_text(name)}</div>'
+                    f'<div class="sov-track"><div class="sov-fill" '
+                    f'style="width:{width:.1f}%"></div></div>'
+                    f'<div class="sov-count">{pct:.0f}% · {count}</div>'
+                    f'</div>'
+                )
+            st.markdown('<div class="sov">' + "".join(sov_rows) + "</div>", unsafe_allow_html=True)
+            st.caption(
+                f"Percent of {answers_naming_any} answers that named you or a "
+                f"tracked competitor (n={answers_naming_any})."
+            )
 
         st.markdown("### Export")
         export_rows = []
@@ -1790,9 +1900,17 @@ with tab_report:
     with col_rep_brand:
         if active_rep_pid:
             p_obj = get_project(active_rep_pid)
-            brand_choices = [p_obj["brand_name"]] if p_obj else [st.session_state.scan_brand]
+            brand_choices = [p_obj["brand_name"]] if p_obj else [
+                resolve_display_brand(
+                    bool(st.session_state.is_sample), st.session_state.scan_brand
+                ) or SAMPLE_BRAND
+            ]
         else:
-            brand_choices = all_scan_brands if all_scan_brands else [st.session_state.scan_brand]
+            brand_choices = all_scan_brands if all_scan_brands else [
+                resolve_display_brand(
+                    bool(st.session_state.is_sample), st.session_state.scan_brand
+                ) or SAMPLE_BRAND
+            ]
         
         target_report_brand = st.selectbox(
             "Target brand",
@@ -1850,12 +1968,20 @@ with tab_report:
 
     # If no stored results in DB (e.g. running on sample dashboard state), use current session scan results
     using_session_fallback = False
+    sample_in_report = False
     if not raw_report_results and st.session_state.scan_results:
+        # The sample dataset always reports as its own brand; the selector must
+        # never relabel it as the brand typed in the sidebar.
+        fallback_brand = resolve_display_brand(
+            bool(st.session_state.is_sample), target_report_brand
+        )
         raw_report_results = [
-            dict(r, scan_brand=target_report_brand, scan_created_at=datetime.now().strftime("%Y-%m-%d"))
+            dict(r, scan_brand=fallback_brand, scan_created_at=datetime.now().strftime("%Y-%m-%d"))
             for r in st.session_state.scan_results
         ]
+        target_report_brand = fallback_brand
         using_session_fallback = True
+        sample_in_report = bool(st.session_state.is_sample)
 
     # Language model options in filtered rows
     present_models = list(dict.fromkeys([
@@ -1916,12 +2042,18 @@ with tab_report:
         f'</div>',
         unsafe_allow_html=True
     )
+    if sample_in_report:
+        st.info(SAMPLE_DATA_LABEL)
 
     if num_answers == 0:
         st.info("No answers match the selected filters. Adjust your date range, tag, or model selection.")
     else:
         # Compute metrics
         rep_metrics = compute_brand_report_metrics(filtered_report_results, target_brand=target_report_brand)
+
+        # Honest banner when the analyzer could not grade enough answers.
+        if rep_metrics["analysis_incomplete"]:
+            st.warning(rep_metrics["analysis_incomplete_message"])
 
         # Exclusion alert
         if rep_metrics["failed_calls"] > 0:
@@ -1934,13 +2066,21 @@ with tab_report:
         st.markdown("#### Visibility overview")
         kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
         with kpi_col1:
+            if rep_metrics["share_of_voice_pct"] is None:
+                sov_value = "Not available"
+                sov_detail = "Requires competitor data from the analyzer."
+            else:
+                sov_value = f'{rep_metrics["share_of_voice_pct"]:.1f}%'
+                sov_detail = (
+                    f'{rep_metrics["target_brand_mentions"]} of '
+                    f'{rep_metrics["sov_n"]} answers named you or a tracked competitor '
+                    f'(n={rep_metrics["sov_n"]}).'
+                )
             st.markdown(
                 f'<div class="brand-panel">'
                 f'<div class="sov-name" style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--pencil);">Share of voice</div>'
-                f'<div style="font-size: 32px; font-weight: 700; color: var(--graphite); margin: 6px 0;">{rep_metrics["share_of_voice_pct"]:.1f}%</div>'
-                f'<div style="font-size: 13px; color: var(--pencil);">'
-                f'{rep_metrics["target_brand_mentions"]} mentions out of {rep_metrics["total_all_mentions"]} total brand mentions in range.'
-                f'</div>'
+                f'<div style="font-size: 32px; font-weight: 700; color: var(--graphite); margin: 6px 0;">{sov_value}</div>'
+                f'<div style="font-size: 13px; color: var(--pencil);">{sov_detail}</div>'
                 f'</div>',
                 unsafe_allow_html=True
             )
@@ -1958,15 +2098,22 @@ with tab_report:
             )
         with kpi_col3:
             s_counts = rep_metrics["sentiment_counts"]
-            total_sent = sum(s_counts.values())
-            pos_pct = (s_counts["positive"] / total_sent * 100.0) if total_sent > 0 else 0.0
+            total_sent = rep_metrics["sentiment_evaluated"]
+            if not rep_metrics["sentiment_available"]:
+                sentiment_value = "Not evaluated"
+                sentiment_detail = "Sentiment requires a working analyzer."
+            else:
+                pos_pct = (s_counts["positive"] / total_sent * 100.0) if total_sent > 0 else 0.0
+                sentiment_value = f"{pos_pct:.0f}% Positive"
+                sentiment_detail = (
+                    f'{s_counts["positive"]} positive, {s_counts["neutral"]} neutral, '
+                    f'{s_counts["negative"]} negative ({total_sent} evaluated).'
+                )
             st.markdown(
                 f'<div class="brand-panel">'
                 f'<div class="sov-name" style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--pencil);">Sentiment tone</div>'
-                f'<div style="font-size: 32px; font-weight: 700; color: var(--graphite); margin: 6px 0;">{pos_pct:.0f}% Positive</div>'
-                f'<div style="font-size: 13px; color: var(--pencil);">'
-                f'{s_counts["positive"]} positive, {s_counts["neutral"]} neutral, {s_counts["negative"]} negative ({total_sent} evaluated).'
-                f'</div>'
+                f'<div style="font-size: 32px; font-weight: 700; color: var(--graphite); margin: 6px 0;">{sentiment_value}</div>'
+                f'<div style="font-size: 13px; color: var(--pencil);">{sentiment_detail}</div>'
                 f'</div>',
                 unsafe_allow_html=True
             )
@@ -1976,7 +2123,7 @@ with tab_report:
         # 5. Comparison Panels: Chosen Brand vs. Top 5 Competitors
         st.markdown(f"#### {escape_text(target_report_brand)} vs. Top competitors")
         st.markdown(
-            '<p class="section-note">Comparison across language model completions. Competitors are identified by the analyzer model.</p>',
+            '<p class="section-note">Comparison across language model completions. Competitors are identified by the analyzer model, with a deterministic fallback when it fails.</p>',
             unsafe_allow_html=True
         )
 
@@ -1991,7 +2138,13 @@ with tab_report:
             n_ans = row["answers_with_mention"]
             tot_ans = row["total_answers"]
             m_count = row["mentions"]
-            tot_m = rep_metrics["total_all_mentions"]
+            tot_m = rep_metrics["answers_naming_any_tracked_brand"]
+            if m_pct is None:
+                m_share_text = "Not available"
+                m_share_width = 0.0
+            else:
+                m_share_text = f"{m_pct:.1f}%"
+                m_share_width = m_pct
             avg_p = f"#{row['avg_position']:.1f}" if row.get("avg_position") is not None else "—"
             tied_badge = ' <span style="font-size: 11px; background: var(--rule); padding: 2px 5px; border-radius: 3px;">(Tied)</span>' if row.get("is_tied_coverage") else ""
             target_badge = ' <span style="font-size: 11px; background: var(--highlighter); color: var(--graphite); font-weight: 600; padding: 2px 6px; border-radius: 3px;">YOU</span>' if is_tgt else ""
@@ -2008,8 +2161,8 @@ with tab_report:
                 f'<div class="sov-track"><div class="sov-fill" style="width: {c_pct:.1f}%;"></div></div>'
                 f'</div>'
                 f'<div>'
-                f'<div style="font-size: 13px; color: var(--pencil);">Share of mentions: <strong>{m_pct:.1f}%</strong> <small>({m_count}/{tot_m} mentions)</small></div>'
-                f'<div class="sov-track"><div class="sov-fill" style="width: {m_pct:.1f}%; background: var(--model-sage);"></div></div>'
+                f'<div style="font-size: 13px; color: var(--pencil);">Share of voice: <strong>{m_share_text}</strong> <small>({m_count}/{tot_m} answers naming a tracked brand)</small></div>'
+                f'<div class="sov-track"><div class="sov-fill" style="width: {m_share_width:.1f}%; background: var(--model-sage);"></div></div>'
                 f'</div>'
                 f'</div>'
                 f'</div>',
@@ -2113,7 +2266,9 @@ with tab_report:
 
         detected_gaps = find_visibility_gaps(filtered_report_results, target_brand=target_report_brand)
 
-        if not detected_gaps:
+        if rep_metrics["analysis_incomplete"]:
+            st.info("Can't be calculated without competitor data.")
+        elif not detected_gaps:
             st.success(
                 f"🎉 No major visibility gaps found in this range! Whenever competitors appeared, "
                 f"**{target_report_brand}** also appeared consistently across language models."
@@ -2441,6 +2596,21 @@ with tab_history:
                     st.error(f"Failed to restore database: {e}")
 
     scans = get_all_scans()
+    status_counts_by_scan = get_scan_status_counts() if scans else {}
+    accounting_by_scan = {}
+    accounting_warnings = []
+    for scan in scans:
+        counts = status_counts_by_scan.get(scan["id"], {})
+        stored_expected = scan.get("expected_calls")
+        expected_calls = stored_expected if stored_expected else counts.get("expected_inferred", 0)
+        acc = compute_call_accounting(
+            expected_calls,
+            counts.get("completed", 0),
+            counts.get("failed", 0),
+        )
+        accounting_by_scan[scan["id"]] = acc
+        if acc["warning"]:
+            accounting_warnings.append(f"Scan #{scan['id']}: {acc['warning']}")
 
     if not scans:
         st.markdown(
@@ -2448,18 +2618,25 @@ with tab_history:
             unsafe_allow_html=True
         )
     else:
+        empty_accounting = compute_call_accounting(0, 0, 0)
         history_rows = []
         for scan in scans:
             score = (
                 f"{scan['visibility_score']:.1f}%"
                 if scan["visibility_score"] is not None else "N/A"
             )
+            acc = accounting_by_scan.get(scan["id"], empty_accounting)
+            expected_display = acc["expected"] if acc["expected"] else "—"
             history_rows.append(
                 "<tr>"
                 f'<td class="num">{scan["id"]}</td>'
                 f'<td>{escape_text(scan["brand_name"])}</td>'
                 f'<td>{escape_text(scan["industry"] or "N/A")}</td>'
                 f'<td class="num">{score}</td>'
+                f'<td class="num">{expected_display}</td>'
+                f'<td class="num">{acc["completed"]}</td>'
+                f'<td class="num">{acc["failed"]}</td>'
+                f'<td class="num">{acc["missing"]}</td>'
                 f'<td>{escape_text(scan["created_at"])}</td>'
                 "</tr>"
             )
@@ -2468,12 +2645,20 @@ with tab_history:
             '<div class="table-scroll"><table class="editorial-table">'
             "<thead><tr>"
             '<th class="num">Scan</th><th>Brand</th><th>Industry</th>'
-            '<th class="num">Score</th><th>Date</th>'
+            '<th class="num">Score</th><th class="num">Expected</th>'
+            '<th class="num">Completed</th><th class="num">Failed</th>'
+            '<th class="num">Missing</th><th>Date</th>'
             "</tr></thead><tbody>"
             + "".join(history_rows) +
             "</tbody></table></div>",
             unsafe_allow_html=True
         )
+        st.caption(
+            "Expected calls are prompts x models x runs, recorded when the scan starts. "
+            "For older scans the total is inferred from the stored rows."
+        )
+        for accounting_warning in accounting_warnings:
+            st.warning(accounting_warning)
 
         selected_scan_id = st.selectbox(
             "Past scan",
